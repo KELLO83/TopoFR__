@@ -19,11 +19,35 @@ import numpy as np
 from backbones.iresnet import IResNet , IBasicBlock
 from multiprocessing.pool import Pool
 from datetime import datetime
+from torch.utils.data import Dataset , DataLoader
 
 try:
     script_dir = os.path.dirname(os.path.abspath(__file__))
 except NameError:
     script_dir = os.getcwd()
+
+class Dataset_load(Dataset):
+    def __init__(self, identity_map):
+        super().__init__()
+        self.all_images = sorted(list(set(itertools.chain.from_iterable(identity_map.values()))))
+
+        self.transform = v2.Compose([
+            v2.ToImage(), 
+            v2.ToDtype(torch.float32, scale=True),
+            v2.CenterCrop(size=(112, 112)),
+            v2.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+        ])
+
+    def __len__(self):
+        return len(self.all_images)
+    
+    def __getitem__(self, index):
+        image_path = self.all_images[index]
+        image = cv2.imread(image_path)
+        image_tensor = self.transform(image)
+        return image_tensor, image_path
+
+
 
 
 def init_worker(worker_embeddings):
@@ -40,83 +64,47 @@ transforms_v2 = v2.Compose([
 
 @torch.inference_mode()
 def get_all_embeddings(identity_map, backbone, device, batch_size):
-
-    logging.info(f"임베딩 추출 배치사이즈 : {batch_size}")
+    """DataLoader를 사용해 이미지를 병렬로 로딩하고, 임베딩을 추출합니다."""
+    
+    logging.info(f"임베딩 추출 시작 (DataLoader 사용, 배치사이즈: {batch_size})")
 
     if isinstance(device, str):
         device = torch.device(device)
     
     backbone = backbone.to(device)
     backbone.eval()
-    embeddings = {} # {이미지경로 : 이미지벡터}
-    all_images = sorted(list(set(itertools.chain.from_iterable(identity_map.values())))) #모든이미지경로 평탄화
-     
-    def preprocess_image(image):
-        transformed_image = transforms_v2(image)
-        return transformed_image
+    
+    embeddings = {} 
+    dataset = Dataset_load(identity_map)
+    dataloader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=os.cpu_count() if os.cpu_count() is not None else 8,
+        pin_memory=True, 
+    )
 
-    for i in tqdm(range(0, len(all_images), batch_size), desc='임베딩 추출'):
-        batch_paths = all_images[i:i+batch_size] # 배치단위로 경로 추출
-        batch_images = []
-        valid_paths = []
 
-        for img_path in batch_paths: # 배치단위로 하나씩 -> tensor값으로 변환
-            try:
-                image = cv2.imread(img_path)
-                if image is None:
-                    logging.warning(f"{img_path} 경로 이미지가 비었습니다")
-                    embeddings[img_path] = None
-                    continue
-
-                if image.shape[0] != 112 or image.shape[1] != 112:
-                    image = cv2.resize(image, (112, 112), interpolation=cv2.INTER_CUBIC if image.shape[0] > 112 else cv2.INTER_AREA)
-                
-                image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-                processed_image = preprocess_image(image_rgb)
-                batch_images.append(processed_image)
-                valid_paths.append(img_path)
-
-            except Exception as e:
-                logging.warning(f"이미지 처리 실패 경로 : {img_path} 오류 : {e}")
-                embeddings[img_path] = None
-        
-        if not batch_images:
+    for batch_tensor, batch_paths in tqdm(dataloader, desc='임베딩 추출'):
+        if batch_tensor is None:
             continue
 
-        batch_tensor = torch.stack(batch_images).to(device) # 배치단위로 하나로만들어
+        batch_tensor = batch_tensor.to(device)
+        with torch.amp.autocast(device_type=device.type, dtype=torch.float16):
+            output = backbone(batch_tensor)
+            vectors = output[1] if isinstance(output, tuple) else output
+            
+        if vectors is not None and vectors.numel() > 0:
+            vectors_cpu = vectors.cpu().numpy()
+            for path, vector in zip(batch_paths, vectors_cpu):
+                embeddings[path] = vector.flatten()
 
-        try:
-            with torch.amp.autocast(device_type=device.type, dtype=torch.float16):
-                
-                output = backbone(batch_tensor)
-                if isinstance(output , tuple):
-                    _ , vectors  = output
 
-                else:
-                    vectors = output
-        
-
-            if vectors is None or vectors.numel() == 0:
-                logging.warning(f"벡터 추출 실패 (배치 크기: {len(batch_paths)})")
-                for path in valid_paths:
-                    embeddings[path] = None
-
-            else:
-                vectors_cpu = vectors.cpu().numpy()
-                for path, vector in zip(valid_paths, vectors_cpu):
-                    embeddings[path] = vector.flatten()
-
-        except Exception as e:
-            logging.warning(f"임베딩 추출 실패 (배치 크기: {len(batch_paths)}) 오류 : {e}")
-            for path in valid_paths:
-                embeddings[path] = None
     try:
-        sp = args.data_path
-        sp = sp.split('/')[-1]
         file_name = f'{args.model}.npz'
-        np.savez_compressed(f'{file_name}' , **embeddings)
+        np.savez_compressed(file_name, **embeddings)
         logging.info(f"임베딩 캐시 저장완료 파일이름 : {file_name}")
-
+        
     except Exception as e:
         logging.info(f'{e}')
         logging.info("@@임베딩 캐시 저장 실패 코드검수.....!!@@")
