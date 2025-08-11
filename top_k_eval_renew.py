@@ -43,15 +43,46 @@ class Dataset_load(Dataset):
     
     def __getitem__(self, index):
         image_path = self.all_images[index]
-        image = cv2.imread(image_path)
+        image = cv2.imread(image_path) # BGR순서로 읽음..
+        image = cv2.cvtColor(image , cv2.COLOR_BGR2RGB)
         image_tensor = self.transform(image)
         return image_tensor, image_path
+    
 
+def init_identification_worker(worker_embeddings, gallery_embs_np, gallery_ids):
 
+    global g_embeddings, g_gallery_embeddings_np, g_gallery_identities_ordered
+    g_embeddings = worker_embeddings
+    g_gallery_embeddings_np = gallery_embs_np
+    g_gallery_identities_ordered = gallery_ids
 
+def _evaluate_probe_worker(probe_data):
+    global g_embeddings, g_gallery_embeddings_np, g_gallery_identities_ordered
+    probe_img_path, true_identity = probe_data
+
+    probe_emb = g_embeddings.get(probe_img_path)
+    if probe_emb is None:
+        return -1  
+
+    norm_val = np.linalg.norm(probe_emb)
+    if norm_val == 0:
+        return -1
+    probe_emb_norm = probe_emb / norm_val
+
+    if not np.all(np.isfinite(probe_emb_norm)):
+        return -1
+
+    similarities = np.dot(g_gallery_embeddings_np, probe_emb_norm)
+    ranked_indices = np.argsort(similarities)[::-1]
+    ranked_identities = np.array(g_gallery_identities_ordered)[ranked_indices]
+    match_indices = np.where(ranked_identities == true_identity)[0]
+
+    if len(match_indices) > 0:
+        return match_indices[0] + 1  # Return 1-based rank
+    else:
+        return -1 # Not found
 
 def init_worker(worker_embeddings):
-    """워커 프로세스 초기화 함수. embeddings 딕셔너리를 전역 변수로 설정합니다."""
     global embeddings
     embeddings = worker_embeddings
 
@@ -64,9 +95,8 @@ transforms_v2 = v2.Compose([
 
 @torch.inference_mode()
 def get_all_embeddings(identity_map, backbone, device, batch_size):
-    """DataLoader를 사용해 이미지를 병렬로 로딩하고, 임베딩을 추출합니다."""
     
-    logging.info(f"임베딩 추출 시작 (DataLoader 사용, 배치사이즈: {batch_size})")
+    logging.info(f"임베딩 추출 시작 ( 배치사이즈: {batch_size})")
 
     if isinstance(device, str):
         device = torch.device(device)
@@ -101,9 +131,10 @@ def get_all_embeddings(identity_map, backbone, device, batch_size):
 
 
     try:
-        file_name = f'{args.model}.npz'
-        np.savez_compressed(file_name, **embeddings)
-        logging.info(f"임베딩 캐시 저장완료 파일이름 : {file_name}")
+        if args.save_cache:
+            file_name = f'{args.model}.npz'
+            np.savez_compressed(file_name, **embeddings)
+            logging.info(f"임베딩 캐시 저장완료 파일이름 : {file_name}")
         
     except Exception as e:
         logging.info(f'{e}')
@@ -165,49 +196,59 @@ def _calculate_similarity_for_pair(pair):
                 return cosine_similarity
     return None # 계산 실패 시 None 반환
 
-def calculate_identification_metrics(identity_map, embeddings ):
+def calculate_identification_metrics(identity_map, embeddings):
     logging.info("Calculating identification metrics (Rank-k, CMC)...")
 
-    gallery_images = {} # {identity: image_path}
-    probe_images_with_labels = [] # [(image_path, identity)]
+    gallery_images = {} 
+    probe_images_with_labels = []
 
-    # Split data into gallery and probe sets
-    # For each identity, take one image for gallery, rest for probes
+
+    REPRESENTATIVE_IMAGE_INDEX = 2098
+    CLASS_LEN = len(next(iter(identity_map.values())))
+
+    if CLASS_LEN < REPRESENTATIVE_IMAGE_INDEX:
+        logging.info(f"{CLASS_LEN} has fewer than {REPRESENTATIVE_IMAGE_INDEX} images; using the first image for the gallery.")
+
     for identity, img_paths in identity_map.items():
         if not img_paths:
             continue
-        
-        # Use the first image as gallery representative
+
         try:
-            gallery_images[identity] = img_paths[2098]
-            idx = 2098 
-        except:
-            logging.info("대표이미지 0으로 설정함 top k 부정확")
+            gallery_images[identity] = img_paths[REPRESENTATIVE_IMAGE_INDEX]
+            idx = REPRESENTATIVE_IMAGE_INDEX 
+
+        except IndexError:
             gallery_images[identity] = img_paths[0]
             idx = 0
 
-        for i in range(0, len(img_paths)):
+        for i in range(len(img_paths)):
             if i == idx:
                 continue
-            probe_images_with_labels.append((img_paths[i], identity))  # 이미지와 해당사람 클래스
-    
+            probe_images_with_labels.append((img_paths[i], identity))
     
     if not probe_images_with_labels:
         logging.warning("No probe images available for identification evaluation. Skipping identification metrics.")
         return None, None, None, None, None
 
-    logging.info(f"Identities in gallery: {len(gallery_images)}")
+    logging.info(f"Total Class : {len(gallery_images)}")
     logging.info(f"Total probe images: {len(probe_images_with_labels)}")
 
-    # Prepare gallery embeddings
-    gallery_embeddings = [] # list of (embedding, identity)
-    gallery_identities_ordered = [] # ordered list of identities corresponding to gallery_embeddings
-    for identity in sorted(gallery_images.keys()): # Sort to ensure consistent order
+    gallery_embeddings = [] 
+    gallery_identities_ordered = [] 
+    for identity in sorted(gallery_images.keys()): 
         img_path = gallery_images[identity]
-        emb = embeddings.get(img_path) # 대표이미지 임베딩값 추출
+        emb = embeddings.get(img_path)
         if emb is not None:
-            gallery_embeddings.append(emb / np.linalg.norm(emb)) # Normalize
-            gallery_identities_ordered.append(identity)
+            norm = np.linalg.norm(emb)
+            if norm > 0:
+                norm_emb = emb / norm
+                if np.all(np.isfinite(norm_emb)):
+                    gallery_embeddings.append(norm_emb)
+                    gallery_identities_ordered.append(identity)
+                else:
+                    logging.warning(f"Non-finite gallery embedding for identity {identity}: {img_path}")
+            else:
+                logging.warning(f"Zero-norm gallery embedding found for identity {identity}: {img_path}")
         else:
             logging.warning(f"Gallery image embedding missing for identity {identity}: {img_path}")
     
@@ -217,61 +258,33 @@ def calculate_identification_metrics(identity_map, embeddings ):
 
     gallery_embeddings_np = np.array(gallery_embeddings)
 
-    # Max rank for CMC curve
-    max_rank = len(gallery_identities_ordered) # Max possible rank is number of identities in gallery
-    if max_rank == 0: # Avoid division by zero if no gallery
+    max_rank = len(gallery_identities_ordered) 
+    if max_rank == 0: 
         logging.error("Gallery is empty. Cannot calculate identification metrics.")
         return None, None, None, None, None
-    
-    cmc_hits = np.zeros(max_rank, dtype=int)
-    total_probes = 0
 
-    rank_1_correct = 0
-    rank_5_correct = 0
-    
-    for probe_img_path, true_identity in tqdm(probe_images_with_labels, desc="Evaluating identification"):
-        probe_emb = embeddings.get(probe_img_path) # 추측 임베딩 추출
-        if probe_emb is None:
-            logging.warning(f"Probe image embedding missing: {probe_img_path}. Skipping.")
-            continue
-        
-        probe_emb_norm = probe_emb / np.linalg.norm(probe_emb)
+    from multiprocessing import Pool, cpu_count
 
-        # Calculate similarities with all gallery embeddings
-        similarities = np.dot(gallery_embeddings_np, probe_emb_norm)# (class , 512 )  dot (512 ,)= (class, 1) -> 에측이미지에대하여 대표이미지 전부 유사한정도 구하기 
-        
-        # Get ranks (indices of sorted similarities in descending order)
-        # argsort returns indices that would sort an array in ascending order.
-        # To get descending, we can negate the similarities and then argsort.
-        ranked_indices = np.argsort(similarities)[::-1] 
-        
-        # Find the rank of the true identity
-        true_identity_rank = -1
-        for rank, idx in enumerate(ranked_indices):
-            if gallery_identities_ordered[idx] == true_identity:
-                true_identity_rank = rank + 1 # Rank is 1-based
-                break
-        
-        if true_identity_rank != -1:
-            # Update CMC hits
-            for r in range(true_identity_rank, max_rank + 1):
-                cmc_hits[r-1] += 1 # cmc_hits is 0-indexed
-            
-            # Update Rank-1 and Rank-5
-            if true_identity_rank == 1:
-                rank_1_correct += 1
-            if true_identity_rank <= 5:
-                rank_5_correct += 1
-        
-        total_probes += 1
+    init_args = (embeddings, gallery_embeddings_np, gallery_identities_ordered)
+    all_ranks = []
+    with Pool(initializer=init_identification_worker, initargs=init_args, processes=cpu_count()) as pool:
+        results_iterator = pool.imap(_evaluate_probe_worker, probe_images_with_labels, chunksize=1000)
+        all_ranks = list(tqdm(results_iterator, total=len(probe_images_with_labels), desc="Evaluating identification (multi-process)"))
+
+    valid_ranks = [r for r in all_ranks if r > 0]
+    total_probes = len(valid_ranks)
 
     if total_probes == 0:
-        logging.warning("No valid probes processed for identification evaluation.")
+        logging.warning("No valid probes were processed.")
         return None, None, None, None, None
 
-    rank_1_accuracy = rank_1_correct / total_probes
-    rank_5_accuracy = rank_5_correct / total_probes
+    valid_ranks_np = np.array(valid_ranks)
+    rank_counts = np.bincount(valid_ranks_np, minlength=max_rank + 1)
     
+    rank_1_accuracy = rank_counts[1] / total_probes
+    rank_5_accuracy = np.sum(rank_counts[1:6]) / total_probes
+    
+    cmc_hits = np.cumsum(rank_counts[1:max_rank + 1])
     cmc_curve = cmc_hits / total_probes
 
     logging.info(f"Rank-1 Accuracy: {rank_1_accuracy:.4f}")
@@ -281,13 +294,18 @@ def calculate_identification_metrics(identity_map, embeddings ):
     return rank_1_accuracy, rank_5_accuracy, cmc_curve, max_rank, total_probes
 
 def main(args):
-    LOG_FILE = os.path.join(script_dir , f'{args.model}_LOG.log')
+    LOG_FILE = os.path.join(script_dir , f'{args.model}_result.log')
     torch.backends.cudnn.benchmark = True
     np.random.seed(42)
     random.seed(42)
+
     logging.basicConfig(
-        filename=LOG_FILE, level=logging.WARNING,
-        format='%(asctime)s - %(levelname)s - %(message)s', filemode='w'
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(f"{args.model}_LOG.log" , mode='w'),
+            logging.StreamHandler()
+        ]
     )
     
     if not os.path.isdir(args.data_path):
@@ -316,11 +334,11 @@ def main(args):
 
 
     load_result = backbone.load_state_dict(torch.load(Weight_path, map_location='cpu'), strict=False)
-    print("누락된 가중치 : {}".format(load_result.missing_keys))
-    print("예상치못한 가중치 : {}".format(load_result.unexpected_keys))
+    logging.info("누락된 가중치 : {}".format(load_result.missing_keys))
+    logging.info("예상치못한 가중치 : {}".format(load_result.unexpected_keys))
 
     if not load_result.missing_keys and not load_result.unexpected_keys:
-        print("모델 가중치가 성공적으로 로드되었습니다.")
+        logging.info("모델 가중치가 성공적으로 로드되었습니다.")
 
     flag = str(input("진행시 아무키... (1)종료..."))
     if flag == '1':
@@ -339,9 +357,9 @@ def main(args):
     
     if not identity_map:
         raise ValueError("데이터셋에서 2개 이상의 이미지를 가진 인물을 찾지 못했습니다.")
-    print(f"총 {len(identity_map)}명의 인물, {sum(len(v) for v in identity_map.values())}개의 이미지를 찾았습니다.")
+    logging.info(f"총 {len(identity_map)}명의 인물, {sum(len(v) for v in identity_map.values())}개의 이미지를 찾았습니다.")
 
-    print("\n평가에 사용할 동일 인물/다른 인물 쌍을 생성합니다...")
+    logging.info("\n평가에 사용할 동일 인물/다른 인물 쌍을 생성합니다...")
     
     positive_pairs = []
     for imgs in tqdm(identity_map.values(), desc="동일 인물 쌍 생성"):
@@ -363,7 +381,7 @@ def main(args):
                     pbar.update(1)
     negative_pairs = list(negative_pairs_set)
 
-    print(f"- 동일 인물 쌍: {len(positive_pairs)}개, 다른 인물 쌍: {len(negative_pairs)}개")
+    logging.info(f"- 동일 인물 쌍: {len(positive_pairs)}개, 다른 인물 쌍: {len(negative_pairs)}개")
 
 
     if args.load_cache is not None :
@@ -468,14 +486,14 @@ def main(args):
             log_file.write(f"   - 평균값: {np.mean(neg_similarities.astype(np.float64)):.4f}\n")
             log_file.write(f"   - 표준편차: {neg_std:.4f}\n" if isinstance(neg_std, (int, float)) else f"   - 표준편차: {neg_std}\n")
     else:
-        print("유사도 데이터가 충분하지 않아 분포 분석을 수행할 수 없습니다.")
-        print(f"len pos : {len(pos_similarities)}, len neg: {len(neg_similarities)}")
+        logging.info("유사도 데이터가 충분하지 않아 분포 분석을 수행할 수 없습니다.")
+        logging.info(f"len pos : {len(pos_similarities)}, len neg: {len(neg_similarities)}")
         exit(0)
     
     scores = np.concatenate([pos_similarities, neg_similarities])
     labels = np.concatenate([pos_labels, neg_labels])
 
-    print("\n--- 최종 평가 결과 ---")
+    logging.info("\n--- 최종 평가 결과 ---")
     if labels.size > 0:
         fpr, tpr, thresholds = roc_curve(labels, scores)
         roc_auc = auc(fpr, tpr)
@@ -628,6 +646,7 @@ if __name__ == "__main__":
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="사용할 장치 (예: cpu, cuda, cuda:0)")
     parser.add_argument("--batch_size", type=int, default=512, help="임베딩 추출 시 배치 크기")
     parser.add_argument('--load_cache' , type=str , default = None ,help="임베딩 캐시경로")
+    parser.add_argument('--save_cache' , action='store_true')
     args = parser.parse_args()
 
     for key , values in args.__dict__.items():
