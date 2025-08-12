@@ -669,7 +669,7 @@ def plot_roc_curve(fpr, tpr, roc_auc, model_name, excel_path):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="SEvaluation Script")
-    parser.add_argument('--model',type=str , default='Glint360K_R50_TopoFR_9727', choices=['Glint360K_R50_TopoFR_9727', 'Glint360K_R200_TopoFR', 'MS1MV2_R200_TopoFR', 'Glint360K_R100_TopoFR_9760'],)
+    parser.add_argument('--model',type=str , default='Glint360K_R200_TopoFR', choices=['Glint360K_R50_TopoFR_9727', 'Glint360K_R200_TopoFR', 'MS1MV2_R200_TopoFR', 'Glint360K_R100_TopoFR_9760'],)
     parser.add_argument("--data_path", type=str, default="/home/ubuntu/KOR_DATA/일반/kor_data_sorting", help="평가할 데이터셋의 루트 폴더")
     parser.add_argument("--excel_path", type=str, default="evaluation_results.xlsx", help="결과를 저장할 Excel 파일 이름")
     parser.add_argument("--target_fars", nargs='+', type=float, default=[0.01, 0.001, 0.0001], help="TAR을 계산할 FAR 목표값들")
