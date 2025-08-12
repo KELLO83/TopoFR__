@@ -20,6 +20,7 @@ from backbones.iresnet import IResNet , IBasicBlock
 from multiprocessing.pool import Pool
 from datetime import datetime
 from torch.utils.data import Dataset , DataLoader
+import gc
 
 try:
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -426,6 +427,12 @@ def main(args):
             identity_map, backbone ,args.batch_size
         )
 
+
+    del backbone
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
     with Pool(initializer=init_worker, initargs=(embeddings,)) as pool:
         
         pos_results = list(tqdm(pool.imap_unordered(_calculate_similarity_for_pair, positive_pairs_generator, chunksize= 1000), 
@@ -679,7 +686,7 @@ if __name__ == "__main__":
     parser.add_argument('--save_cache' , action='store_true')
     args = parser.parse_args()
 
-    #args.data_path = '/home/ubuntu/KOR_DATA/kor_data_full_Middle_Resolution_aligend'
+    args.data_path = '/home/ubuntu/KOR_DATA/kor_data_full_Middle_Resolution_aligend'
 
     for key , values in args.__dict__.items():
         print(f"key {key}  :  {values}")
