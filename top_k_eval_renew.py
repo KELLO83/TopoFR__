@@ -316,7 +316,11 @@ def generate_negative_pairs_parallel(identity_map, num_target_pairs, num_cpus):
     random.shuffle(all_images_with_id)
     logging.info(f"총 {len(all_images_with_id)}개 이미지에 대한 쌍 생성 시작...")
 
-    chunk_size = 200000
+    # 청크 사이즈는 각 코어가 한 번에 처리할 작업량입니다.
+    # 이 값이 너무 크면 -> 메인 프로세스가 청크를 만드는 데 시간이 걸려 다른 코어들이 대기하게 됩니다.
+    # 이 값이 너무 작으면 -> 코어들이 너무 자주 메인 프로세스와 통신해야 해서 오버헤드가 발생합니다.
+    # 시스템 환경과 데이터셋 크기에 따라 10,000 ~ 100,000 사이의 값으로 튜닝하면 좋습니다.
+    chunk_size = 20000
     
     pair_generator = itertools.combinations(all_images_with_id, 2)
     master_set = set()
@@ -336,7 +340,7 @@ def generate_negative_pairs_parallel(identity_map, num_target_pairs, num_cpus):
                 if len(master_set) >= num_target_pairs:
                     pbar.n = pbar.total
                     pbar.refresh()
-                    pool.terminate() 
+                    logging.info(f"\n목표치({num_target_pairs}) 달성! 새로운 작업을 중단하고 현재 진행중인 작업이 끝나기를 기다립니다...")
                     break
     
     logging.info(f"\n총 {len(master_set)}개의 고유한 쌍을 찾았습니다. 목표 개수로 조정합니다...")
