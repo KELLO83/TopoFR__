@@ -3,6 +3,7 @@
 *.html
 *.npz
 *.xlsx
+*.npy
 
 # .gitignore 파일은 무시하지 않음
 !.gitignore

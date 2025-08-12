@@ -77,11 +77,12 @@ def find_max_batch_size(model, input_shape, device):
                 break
             else:
                 raise e
-            
-        if batch_size > 2048 * 5:
-                print("안전 제한 도달. 탐색을 중단합니다.")
-                break
         
+
+        if batch_size > 2048 * 5:
+             print("안전 제한 도달. 탐색을 중단합니다.")
+             break
+
     return max_batch_size
 
 
@@ -205,7 +206,7 @@ def _calculate_similarity_for_pair(pair):
 
         if norm1 > 0 and norm2 > 0:
             cosine_similarity = torch.dot(emb1, emb2) / (norm1 * norm2)
-            return cosine_similarity.cpu().numpy().astype(np.float16)
+            return cosine_similarity.cpu().numpy()
             
     return None
 
@@ -406,12 +407,13 @@ def main(args):
 
     logging.info("\n평가에 사용할 동일 인물/다른 인물 쌍 생성을 준비합니다 (제너레이터 사용)...")
 
-    
+    # 메모리에 모든 쌍을 저장하는 대신, 쌍의 개수만 미리 계산
     num_positive_pairs = sum(len(imgs) * (len(imgs) - 1) // 2 for imgs in identity_map.values())
-    num_negative_pairs = num_positive_pairs  
+    num_negative_pairs = num_positive_pairs  # 동일한 개수로 생성
 
     logging.info(f"- 동일 인물 쌍 (Generator 생성..): {num_positive_pairs}개, 다른 인물 쌍 (Generator 생성..): {num_negative_pairs}개")
 
+    # 제너레이터 생성
     positive_pairs_generator = generate_positive_pairs(identity_map)
     negative_pairs_generator = generate_negative_pairs(identity_map, num_negative_pairs)
 
@@ -433,42 +435,43 @@ def main(args):
 
     import time
     start_time = time.time()
+
     with Pool(initializer=init_worker, initargs=(embeddings,)) as pool:
+        
+        pos_results = list(tqdm(pool.imap_unordered(_calculate_similarity_for_pair, positive_pairs_generator, chunksize= 1000), 
+                                total=num_positive_pairs, 
+                                desc="동일 인물 쌍 계산"))
+        pos_similarities = [r for r in pos_results if r is not None]
+        pos_labels = [1] * len(pos_similarities)
 
-        with open('similarity_for_pair.npy', 'wb') as f:
-            pos_results_gen = pool.imap_unordered(_calculate_similarity_for_pair, positive_pairs_generator, chunksize=1000)
-            for result in tqdm(pos_results_gen, total=num_positive_pairs, desc="동일 인물 쌍 계산 및 저장"):
-                if result is not None:
-                    result.tofile(f)
+        neg_results = list(tqdm(pool.imap_unordered(_calculate_similarity_for_pair, negative_pairs_generator, chunksize = 1000), 
+                                total=num_negative_pairs, 
+                                desc="다른 인물 쌍 계산"))
+        neg_similarities = [r for r in neg_results if r is not None]
+        neg_labels = [0] * len(neg_similarities)
 
-        with open('negative_for_pair.npy', 'wb') as f:
-            neg_results_gen = pool.imap_unordered(_calculate_similarity_for_pair, negative_pairs_generator, chunksize=1000)
-            for result in tqdm(neg_results_gen, total=num_negative_pairs, desc="다른 인물 쌍 계산 및 저장"):
-                if result is not None:
-                    result.tofile(f)
-
-    end_time = time.time() - start_time
-    logging.info(f"유사도 계산 및 파일 작성 완료. 소요시간: {end_time:.5f}초")
-
-    import time
-    start_time = time.time()
-    logging.info("파일에서 유사도 데이터를 로딩합니다 (NumPy 사용)...")
-    try:
-        pos_similarities = np.fromfile('similarity_for_pair.npy', dtype=np.float16)
-        logging.info(f"동일 인물 유사도 로딩 완료: {len(pos_similarities)}개")
-
-        neg_similarities = np.fromfile('negative_for_pair.npy', dtype=np.float16)
-        logging.info(f"다른 인물 유사도 로딩 완료: {len(neg_similarities)}개")
-
-    except FileNotFoundError as e:
-        logging.error(f"오류: {e}.")
-        exit(1)
+    
 
     end_time = time.time() - start_time
-    logging.info(f"파일 로드 소요시간: {end_time:.5f}초")
+    logging.info(f"유사도 계산. 소요시간: {end_time:.5f}초")
 
-    pos_labels = np.ones(len(pos_similarities))
-    neg_labels = np.zeros(len(neg_similarities))
+    print(f"🔍 디버깅 정보:")
+    print(f"   - 전체 임베딩 수: {len(embeddings)}")
+    print(f"   - 유효한 임베딩 수: {sum(1 for v in embeddings.values() if v is not None)}")
+    print(f"   - None 임베딩 수: {sum(1 for v in embeddings.values() if v is None)}")
+    print(f"   - 양성 쌍 유사도 수 (변환 전): {len(pos_similarities)}")
+    print(f"   - 음성 쌍 유사도 수 (변환 전): {len(neg_similarities)}")
+    
+    pos_similarities_array = np.array(pos_similarities)
+    neg_similarities_array = np.array(neg_similarities)
+    
+    print(f"   - NaN 개수 (양성/음성): {np.isnan(pos_similarities_array).sum()} / {np.isnan(neg_similarities_array).sum()}")
+    print(f"   - Inf 개수 (양성/음성): {np.isinf(pos_similarities_array).sum()} / {np.isinf(neg_similarities_array).sum()}")
+
+    pos_similarities = pos_similarities_array
+    neg_similarities = neg_similarities_array
+    pos_labels = np.array(pos_labels)
+    neg_labels = np.array(neg_labels)
 
     pos_finite_mask = np.isfinite(pos_similarities)
     neg_finite_mask = np.isfinite(neg_similarities)
