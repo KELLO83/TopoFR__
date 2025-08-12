@@ -686,7 +686,7 @@ if __name__ == "__main__":
     parser.add_argument('--save_cache' , action='store_true')
     args = parser.parse_args()
 
-    args.data_path = '/home/ubuntu/KOR_DATA/kor_data_full_Middle_Resolution_aligend'
+    #args.data_path = '/home/ubuntu/KOR_DATA/kor_data_full_Middle_Resolution_aligend'
 
     for key , values in args.__dict__.items():
         print(f"key {key}  :  {values}")
