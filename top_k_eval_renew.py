@@ -79,7 +79,7 @@ def find_max_batch_size(model, input_shape, device):
                 raise e
         
 
-        if batch_size > 2048 * 2:
+        if batch_size > 2048 * 4:
              print("안전 제한 도달. 탐색을 중단합니다.")
              break
 
