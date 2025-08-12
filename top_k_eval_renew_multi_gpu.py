@@ -20,11 +20,35 @@ from backbones.iresnet import IResNet , IBasicBlock
 from multiprocessing.pool import Pool
 from datetime import datetime
 from torch.utils.data import Dataset , DataLoader
+import torch.distributed as dist
 
 try:
     script_dir = os.path.dirname(os.path.abspath(__file__))
 except NameError:
     script_dir = os.getcwd()
+
+
+def setup_ddp(rank , world_size):
+
+    """rank gpu번호  wolrd --> 프로세스 수 """
+    os.environ['MASTER_ADDR'] = '127.0.0.1'
+    os.environ['MASTER_PORT'] = '12355'
+
+    torch.distributed.init_process_group(
+        backend='nccl',
+        rank=rank,
+        world_size=world_size
+    )
+
+    torch.cuda.set_device(rank)
+
+    print(f"Multi GPU SETUP - RANK: {rank}, WORLD_SIZE: {world_size}")
+    return rank
+
+def cleanup_ddp():
+    if torch.distributed.is_initialized():
+        torch.distributed.destroy_process_group()
+
 
 class Dataset_load(Dataset):
     def __init__(self, identity_map):
@@ -94,13 +118,65 @@ transforms_v2 = v2.Compose([
 ])
 
 @torch.inference_mode()
-def get_all_embeddings(identity_map, backbone, device, batch_size):
-    
-    logging.info(f"임베딩 추출 시작 ( 배치사이즈: {batch_size})")
+def get_all_embeddings(rank, world_size, identity_map, backbone, batch_size, temp_file_path):
 
-    if isinstance(device, str):
-        device = torch.device(device)
+    setup_ddp(rank, world_size)
+
+    try:
+        device = torch.device(f"cuda:{rank}")
+        
+        model = backbone.to(device)
+        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[rank], find_unused_parameters=True)
+        model.eval()
+
+        dataset = Dataset_load(identity_map)
+        sampler = torch.utils.data.DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=False)
+        
+        num_workers = (os.cpu_count() // world_size) if world_size > 0 else os.cpu_count()
+        loader = DataLoader(
+            dataset, batch_size=batch_size, num_workers=num_workers, 
+            sampler=sampler, pin_memory=True
+        )
+
+        local_embeddings = {}
+        desc = f"임베딩 추출 (GPU {rank})"
+        
+        for batch_tensor, batch_paths in tqdm(loader, desc=desc, disable=not (rank == 0)):
+            batch_tensor = batch_tensor.to(device, non_blocking=True)
+            with torch.amp.autocast(device_type=device.type, dtype=torch.float16):
+                output = model(batch_tensor)
+                vectors = output[1] if isinstance(output, tuple) else output
+                
+            if vectors is not None and vectors.numel() > 0:
+                vectors_cpu = vectors.cpu().numpy()
+                for path, vector in zip(batch_paths, vectors_cpu):
+                    local_embeddings[path] = vector.flatten()
+
+        # 모든 프로세스의 결과를 수집
+        dist.barrier()
+        gathered_objects = [None] * world_size
+        dist.all_gather_object(gathered_objects, local_embeddings)
+
+        # Rank 0 프로세스만 결과를 파일에 저장
+        if rank == 0:
+            final_embeddings = {}
+            for embeddings_dict in gathered_objects:
+                final_embeddings.update(embeddings_dict)
+            
+            logging.info(f"모든 GPU로부터 총 {len(final_embeddings)}개의 임베딩을 취합했습니다.")
+            with open(temp_file_path, 'wb') as f:
+                pickle.dump(final_embeddings, f)
+            logging.info(f"취합된 임베딩을 임시 파일에 저장했습니다: {temp_file_path}")
+
+    finally:
+        cleanup_ddp()
+
+        
     
+
+    
+
+def singl_embedding_vecotr(identity_map, backbone, batch_size, device):
     backbone = backbone.to(device)
     backbone.eval()
     
@@ -347,14 +423,8 @@ def main(args):
 
     backbone = torch.compile(backbone)
 
-    all_person_folders = sorted(os.listdir(args.data_path))
-    num_folders_to_process = len(all_person_folders) // 1
-    folders_to_process = all_person_folders[:num_folders_to_process]
-
-    logging.info(f"사람 클래스 수 : {len(folders_to_process)}")
-
     identity_map = {} # 사람폴더라벨 : 해당 폴더 사람 이미지 경로
-    for person_folder in folders_to_process:
+    for person_folder in sorted(os.listdir(args.data_path)):
         person_path = os.path.join(args.data_path, person_folder) # 각 사람폴더의 경로
         if os.path.isdir(person_path):
             images = [os.path.join(person_path, f) for f in os.listdir(person_path) if f.lower().endswith(('.png', '.jpg', '.jpeg'))] # 각사람폴더에 들어있는 모든 jpg
@@ -369,7 +439,7 @@ def main(args):
     
     positive_pairs = []
     for imgs in tqdm(identity_map.values(), desc="동일 인물 쌍 생성"):
-        positive_pairs.extend(itertools.combinations(imgs, 2))
+        positive_pairs.extend(itertools.combinations_with_replacement(imgs, 2))
 
     num_positive_pairs = len(positive_pairs)
 
@@ -390,16 +460,41 @@ def main(args):
     logging.info(f"- 동일 인물 쌍: {len(positive_pairs)}개, 다른 인물 쌍: {len(negative_pairs)}개")
 
 
-    if args.load_cache is not None :
-        cache_path = args.load_cache
-        loaded_npz = np.load(cache_path)
-        embeddings = {key: loaded_npz[key] for key in tqdm(loaded_npz.files , desc='임베딩 캐시 로딩..')}
-        embeddings = loaded_npz
+    ngpus_per_node = torch.cuda.device_count()
 
+    if args.load_cache is not None:
+        cache_path = args.load_cache
+        logging.info(f"임베딩 캐시 파일을 로드합니다: {cache_path}")
+        with np.load(cache_path) as loaded_npz:
+            embeddings = {key: loaded_npz[key] for key in tqdm(loaded_npz.files, desc='임베딩 캐시 로딩..')}
     else:
-        embeddings = get_all_embeddings(
-            identity_map, backbone, args.device,args.batch_size
-        )
+        if ngpus_per_node <= 1:
+            logging.info("싱글 GPU 모드로 임베딩을 추출합니다.")
+            device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+            embeddings = singl_embedding_vecotr(
+                identity_map, backbone, args.batch_size, device
+            )
+        else:
+            logging.info(f"{ngpus_per_node}개의 GPU를 사용하여 분산 추론을 시작합니다.")
+            temp_file_path = os.path.join(script_dir, "temp_embeddings.pkl")
+            
+            try:
+                torch.multiprocessing.spawn(
+                    get_all_embeddings,
+                    nprocs=ngpus_per_node,
+                    args=(ngpus_per_node, identity_map, backbone, args.batch_size, temp_file_path),
+                    join=True
+                )
+
+                logging.info("분산 추론 완료. 임시 파일에서 임베딩을 로드합니다.")
+                with open(temp_file_path, 'rb') as f:
+                    embeddings = pickle.load(f)
+            finally:
+                if os.path.exists(temp_file_path):
+                    os.remove(temp_file_path)
+                    logging.info(f"임시 임베딩 파일을 삭제했습니다: {temp_file_path}")
+
+
 
     with Pool(initializer=init_worker, initargs=(embeddings,)) as pool:
         # 1. 동일 인물 쌍 계산
@@ -645,17 +740,16 @@ def plot_roc_curve(fpr, tpr, roc_auc, model_name, excel_path):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="SEvaluation Script")
-    parser.add_argument('--model',type=str , default='Glint360K_R200_TopoFR', choices=['Glint360K_R50_TopoFR_9727', 'Glint360K_R200_TopoFR', 'MS1MV2_R200_TopoFR', 'Glint360K_R100_TopoFR_9760'],)
+    parser.add_argument('--model',type=str , default='Glint360K_R50_TopoFR_9727, Glint360K_R200_TopoFR', choices=['Glint360K_R50_TopoFR_9727, Glint360K_R200_TopoFR', 'MS1MV2_R200_TopoFR', 'Glint360K_R100_TopoFR_9760'],)
     parser.add_argument("--data_path", type=str, default="/home/ubuntu/KOR_DATA/일반/kor_data_sorting", help="평가할 데이터셋의 루트 폴더")
     parser.add_argument("--excel_path", type=str, default="evaluation_results.xlsx", help="결과를 저장할 Excel 파일 이름")
     parser.add_argument("--target_fars", nargs='+', type=float, default=[0.01, 0.001, 0.0001], help="TAR을 계산할 FAR 목표값들")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="사용할 장치 (예: cpu, cuda, cuda:0)")
-    parser.add_argument("--batch_size", type=int, default=512, help="임베딩 추출 시 배치 크기")
+    parser.add_argument("--batch_size", type=int, default=256, help="임베딩 추출 시 배치 크기")
     parser.add_argument('--load_cache' , type=str , default = None ,help="임베딩 캐시경로")
     parser.add_argument('--save_cache' , action='store_true')
     args = parser.parse_args()
-
-    #args.data_path = '/home/ubuntu/KOR_DATA/kor_data_full_Middle_Resolution_aligend'
+    args.data_path = '/home/ubuntu/KOR_DATA/kor_data_full_Middle_Resolution_aligend'
 
     for key , values in args.__dict__.items():
         print(f"key {key}  :  {values}")
