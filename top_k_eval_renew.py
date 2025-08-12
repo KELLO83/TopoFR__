@@ -12,12 +12,12 @@ import traceback
 import pickle
 import argparse
 import matplotlib.pyplot as plt
-import logging
 import torchvision.transforms.v2 as v2
 from PIL import Image
-import numpy as np
 from backbones.iresnet import IResNet , IBasicBlock
 from multiprocessing.pool import Pool
+import multiprocessing
+from itertools import islice
 from datetime import datetime
 from torch.utils.data import Dataset , DataLoader
 
@@ -293,6 +293,62 @@ def calculate_identification_metrics(identity_map, embeddings):
 
     return rank_1_accuracy, rank_5_accuracy, cmc_curve, max_rank, total_probes
 
+def process_pair_chunk(pair_chunk):
+    local_negative_pairs_set = set()
+    for img_info1, img_info2 in pair_chunk:
+        if img_info1['id'] != img_info2['id']:
+            pair = tuple(sorted((img_info1['path'], img_info2['path'])))
+            local_negative_pairs_set.add(pair)
+    return local_negative_pairs_set
+
+def generate_negative_pairs_parallel(identity_map, num_target_pairs, num_cpus):
+    """
+    멀티코어를 사용하여 다른 인물 쌍(negative pairs)을 병렬로 생성합니다.
+    """
+    logging.info("이미지 목록 생성 중...")
+    all_images_with_id = []
+    person_to_int_id = {person_folder: i for i, person_folder in enumerate(identity_map.keys())}
+    for person_folder, image_paths in identity_map.items():
+        person_id = person_to_int_id[person_folder]
+        for path in image_paths:
+            all_images_with_id.append({'id': person_id, 'path': path})
+    
+    random.shuffle(all_images_with_id)
+    logging.info(f"총 {len(all_images_with_id)}개 이미지에 대한 쌍 생성 시작...")
+
+    chunk_size = 200000
+    
+    pair_generator = itertools.combinations(all_images_with_id, 2)
+    master_set = set()
+
+    with multiprocessing.Pool(processes=num_cpus) as pool:
+        with tqdm(total=num_target_pairs, desc=f"쌍 생성 중 ({num_cpus} 코어)") as pbar:
+            chunk_generator = iter(lambda: list(islice(pair_generator, chunk_size)), [])
+            
+            for result_set in pool.imap_unordered(process_pair_chunk, chunk_generator):
+                
+                original_size = len(master_set)
+                master_set.update(result_set)
+                newly_added_count = len(master_set) - original_size
+                
+                pbar.update(newly_added_count)
+                
+                if len(master_set) >= num_target_pairs:
+                    pbar.n = pbar.total
+                    pbar.refresh()
+                    pool.terminate() 
+                    break
+    
+    logging.info(f"\n총 {len(master_set)}개의 고유한 쌍을 찾았습니다. 목표 개수로 조정합니다...")
+    if len(master_set) > num_target_pairs:
+        final_pairs = random.sample(list(master_set), num_target_pairs)
+    else:
+        final_pairs = list(master_set)
+        if len(final_pairs) < num_target_pairs:
+             logging.warning(f"경고: 가능한 모든 쌍({len(final_pairs)}개)을 찾았지만, 목표({num_target_pairs}개)보다 적습니다.")
+
+    return final_pairs
+
 def main(args):
     LOG_FILE = os.path.join(script_dir , f'{args.model}_result.log')
     torch.backends.cudnn.benchmark = True
@@ -373,19 +429,8 @@ def main(args):
 
     num_positive_pairs = len(positive_pairs)
 
-
-    identities = list(identity_map.keys())
-    negative_pairs_set = set()
-    if len(identities) > 1:
-        with tqdm(total=num_positive_pairs, desc="다른 인물 쌍 생성") as pbar:
-            while len(negative_pairs_set) < num_positive_pairs:
-                id1, id2 = random.sample(identities, 2)
-                pair = (random.choice(identity_map[id1]), random.choice(identity_map[id2]))
-                sorted_pair = tuple(sorted(pair))
-                if sorted_pair not in negative_pairs_set:
-                    negative_pairs_set.add(sorted_pair)
-                    pbar.update(1)
-    negative_pairs = list(negative_pairs_set)
+    num_cpus = os.cpu_count() if os.cpu_count() is not None else 8
+    negative_pairs = generate_negative_pairs_parallel(identity_map, num_positive_pairs, num_cpus)
 
     logging.info(f"- 동일 인물 쌍: {len(positive_pairs)}개, 다른 인물 쌍: {len(negative_pairs)}개")
 
@@ -479,8 +524,8 @@ def main(args):
 
 
         with open(LOG_FILE, 'a') as log_file:
-            log_file.write(f"\n--- 유사도 분포 분석 ---\n")
-            log_file.write(f"🔵 동일 인물 쌍 유사도 (총 {len(pos_similarities):,}개):\n")
+            log_file.write(f"\n--- 유사도 분포 분석 ---")
+            log_file.write(f"\n🔵 동일 인물 쌍 유사도 (총 {len(pos_similarities):,}개):\n")
             log_file.write(f"   - 최소값: {np.min(pos_similarities):.4f}\n")
             log_file.write(f"   - 최대값: {np.max(pos_similarities):.4f}\n")
             log_file.write(f"   - 평균값: {np.mean(pos_similarities.astype(np.float64)):.4f}\n")
@@ -579,7 +624,7 @@ def main(args):
                 log_file.write("얼굴 식별 성능을 계산할 수 없습니다 (유효한 프로브 이미지 부족).\n")
                 log_file.write("\n")
 
-        save_results_to_excel(excel_path, args.model, roc_auc, eer, tar_at_far_results, \
+        save_results_to_excel(excel_path, args.model, roc_auc, eer, tar_at_far_results, 
                               args.target_fars, metrics, total_dataset_img_len, total_class, args.data_path, args.model,
                               rank_1_accuracy, rank_5_accuracy)
 
