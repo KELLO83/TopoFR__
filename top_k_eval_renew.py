@@ -79,7 +79,7 @@ def find_max_batch_size(model, input_shape, device):
                 raise e
         
 
-        if batch_size > 2048 * 4:
+        if batch_size > 2048 * 5:
              print("안전 제한 도달. 탐색을 중단합니다.")
              break
 
@@ -378,7 +378,8 @@ def main(args):
         exit(0)
 
     MAX_BATCH_SIZE = find_max_batch_size(backbone , (3,112,112) , device = 'cuda' if torch.cuda.is_available() else 'cpu')
-
+    gc.collect()
+    torch.cuda.empty_cache()
     if MAX_BATCH_SIZE is not None:
         args.batch_size = MAX_BATCH_SIZE // 2
         logging.info(f"배치사이즈 변경(최대치) : {MAX_BATCH_SIZE // 2}")
