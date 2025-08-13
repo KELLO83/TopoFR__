@@ -18,6 +18,9 @@ from multiprocessing.pool import Pool
 from datetime import datetime
 from torch.utils.data import Dataset , DataLoader
 import gc
+from multiprocessing import Process, Queue
+import threading
+import math
 
 try:
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -187,12 +190,28 @@ def get_all_embeddings(identity_map, backbone, batch_size):
 
     return embeddings
 
-def _calculate_similarity_for_pair(pair):
+def _calculate_similarity_for_pair_images(pair):
     global embeddings
     img1_path, img2_path = pair
     
     emb1 = embeddings.get(img1_path)
     emb2 = embeddings.get(img2_path)
+    
+    if emb1 is not None and emb2 is not None:
+        emb1 = emb1.to(torch.float32)
+        emb2 = emb2.to(torch.float32)
+
+        norm1 = torch.norm(emb1)
+        norm2 = torch.norm(emb2)
+
+        if norm1 > 0 and norm2 > 0:
+            cosine_similarity = torch.dot(emb1, emb2) / (norm1 * norm2)
+            return cosine_similarity.cpu().numpy().astype(np.float16)
+            
+    return None
+
+def _calculate_similarity_for_pair_embs(embs_pair):
+    emb1, emb2 = embs_pair
     
     if emb1 is not None and emb2 is not None:
         emb1 = emb1.to(torch.float32)
@@ -303,6 +322,30 @@ def calculate_identification_metrics(identity_map, embeddings):
     logging.info(f"CMC Curve calculated up to rank {max_rank}")
 
     return rank_1_accuracy, rank_5_accuracy, cmc_curve, max_rank, total_probes
+
+def generate_positive_pairs_embs(identity_map, embeddings ):
+    for imgs in identity_map.values():
+        for path1, path2 in itertools.combinations(imgs, 2):
+            emb1 = embeddings.get(path1)
+            emb2 = embeddings.get(path2)
+            if emb1 is not None and emb2 is not None:
+                yield (emb1, emb2)
+
+def generate_negative_pairs_embs(identity_map , embeddings , num_pairs):
+    identities = list(identity_map.keys())
+    if len(identities) < 2:
+        return
+    
+    for _ in range(num_pairs):
+        id1, id2 = random.sample(identities, 2)
+        img1 = random.choice(identity_map[id1])
+        img2 = random.choice(identity_map[id2])
+
+        emb1 = embeddings.get(img1)
+        emb2 = embeddings.get(img2)
+        
+        if emb1 is not None and emb2 is not None:
+            yield (emb1 , emb2)
 
 def generate_positive_pairs(identity_map):
     """동일 인물 쌍을 생성하는 제너레이터"""
@@ -415,9 +458,6 @@ def main(args):
 
     logging.info(f"- 동일 인물 쌍 (Generator 생성..): {num_positive_pairs}개, 다른 인물 쌍 (Generator 생성..): {num_negative_pairs}개")
 
-    positive_pairs_generator = generate_positive_pairs(identity_map)
-    negative_pairs_generator = generate_negative_pairs(identity_map, num_negative_pairs)
-
 
     if args.load_cache is not None :
         cache_path = args.load_cache
@@ -429,6 +469,11 @@ def main(args):
             identity_map, backbone ,args.batch_size
         )
 
+    # positive_embs_generator = generate_positive_pairs_embs(identity_map, embeddings)
+    # negative_embs_generator = generate_negative_pairs_embs(identity_map, embeddings, num_negative_pairs)
+
+    positive_pairs_generator = generate_positive_pairs(identity_map)
+    negative_pairs_generator = generate_negative_pairs(identity_map, num_negative_pairs)
 
     del backbone
     gc.collect()
@@ -436,15 +481,29 @@ def main(args):
 
     import time
     start_time = time.time()
+
+    # with Pool(processes=os.cpu_count()) as pool:
+    #     with open(os.path.join(script_dir, 'similarity_for_pair.npy') , 'wb') as f:
+    #         pos_result_gen = pool.imap_unordered(_calculate_similarity_for_pair_embs , positive_embs_generator , chunksize=1000)
+    #         for result in tqdm(pos_result_gen , total=num_positive_pairs , desc= '동일 인물 쌍 계산 및 저장'):
+    #             if result is not None:
+    #                 result.tofile(f)
+
+    #     with open(os.path.join(script_dir , 'negative_for_pair.npy'), 'wb') as f:
+    #         neg_result_gen = pool.imap_unordered(_calculate_similarity_for_pair_embs , negative_embs_generator , chunksize= 1000)
+    #         for result in tqdm(neg_result_gen , total=num_negative_pairs , desc='다른 인물 쌍 계산 및 저장'):
+    #             if result is not None:
+    #                 result.tofile(f)
+
     with Pool(initializer=init_worker, initargs=(embeddings,)) as pool:
         with open(os.path.join(script_dir, 'similarity_for_pair.npy') , 'wb') as f:
-            pos_results_gen = pool.imap_unordered(_calculate_similarity_for_pair, positive_pairs_generator, chunksize=1000)
+            pos_results_gen = pool.imap_unordered(_calculate_similarity_for_pair_images, positive_pairs_generator, chunksize=1000)
             for result in tqdm(pos_results_gen, total=num_positive_pairs, desc="동일 인물 쌍 계산 및 저장"):
                 if result is not None:
                     result.tofile(f)
 
         with open(os.path.join(script_dir , 'negative_for_pair.npy'), 'wb') as f:
-            neg_results_gen = pool.imap_unordered(_calculate_similarity_for_pair, negative_pairs_generator, chunksize=1000)
+            neg_results_gen = pool.imap_unordered(_calculate_similarity_for_pair_images, negative_pairs_generator, chunksize=1000)
             for result in tqdm(neg_results_gen, total=num_negative_pairs, desc="다른 인물 쌍 계산 및 저장"):
                 if result is not None:
                     result.tofile(f)
@@ -488,8 +547,11 @@ def main(args):
     num_total_embeddings = len(embeddings)
     num_valid_embeddings = sum(1 for v in embeddings.values() if v is not None)
     num_none_embeddings = sum(1 for v in embeddings.values() if v is None)
+    total_dataset_img_len = sum(len(v) for v in identity_map.values())
+    total_class = len(identity_map)
 
     del embeddings
+    del identity_map
     gc.collect()
 
     start_time = time.time()
@@ -636,8 +698,6 @@ def main(args):
             log_file.write("\n")
 
         excel_path = os.path.join(script_dir, args.excel_path)
-        total_dataset_img_len = sum(len(v) for v in identity_map.values())
-        total_class = len(identity_map)
 
         try:
             plot_roc_curve(fpr, tpr, roc_auc, args.model, excel_path)
@@ -715,7 +775,7 @@ def plot_roc_curve(fpr, tpr, roc_auc, model_name, excel_path):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="SEvaluation Script")
-    parser.add_argument('--model',type=str , default='Glint360K_R200_TopoFR', choices=['Glint360K_R200_TopoFR' , 'Glint360K_R50_TopoFR_9727', 'MS1MV2_R200_TopoFR', 'Glint360K_R100_TopoFR_9760'],)
+    parser.add_argument('--model',type=str , default='Glint360K_R50_TopoFR_9727', choices=['Glint360K_R200_TopoFR' , 'Glint360K_R50_TopoFR_9727', 'MS1MV2_R200_TopoFR', 'Glint360K_R100_TopoFR_9760'],)
     parser.add_argument("--data_path", type=str, default="/home/ubuntu/KOR_DATA/일반/kor_data_sorting", help="평가할 데이터셋의 루트 폴더")
     parser.add_argument("--excel_path", type=str, default="evaluation_results.xlsx", help="결과를 저장할 Excel 파일 이름")
     parser.add_argument("--target_fars", nargs='+', type=float, default=[0.01, 0.001, 0.0001], help="TAR을 계산할 FAR 목표값들")
@@ -723,7 +783,7 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=512, help="임베딩 추출 시 배치 크기")
     parser.add_argument('--load_cache' , type=str , default = None ,help="임베딩 캐시경로")
     parser.add_argument('--save_cache' , action='store_true')
-    parser.add_argument('--split',default=4 , help='전체클래스수 / N ')
+    parser.add_argument('--split',default=1 , help='전체클래스수 / N ')
     args = parser.parse_args()
 
     #args.data_path = '/home/ubuntu/KOR_DATA/kor_data_full_Middle_Resolution_aligend'
