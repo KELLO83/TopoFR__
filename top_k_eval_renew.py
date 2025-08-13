@@ -27,6 +27,8 @@ try:
 except NameError:
     script_dir = os.getcwd()
 
+print(f"script dir ---> {script_dir}")
+
 class Dataset_load(Dataset):
     def __init__(self, identity_map):
         super().__init__()
@@ -57,7 +59,7 @@ def find_max_batch_size(model, input_shape, device):
     model.to(device)
     model.eval()
 
-    batch_size = 256
+    batch_size = 512
     max_batch_size = 0
 
     while True:
@@ -68,7 +70,7 @@ def find_max_batch_size(model, input_shape, device):
                 _ = model(dummy_input)
             max_batch_size = batch_size
             print(f"✅ 배치 사이즈 {batch_size} 성공")
-            batch_size *= 2 # 다음 테스트를 위해 배치 사이즈 2배 증가
+            batch_size *= 2 
 
         except RuntimeError as e:
             if 'out of memory' in str(e).lower():
@@ -187,7 +189,6 @@ def get_all_embeddings(identity_map, backbone, batch_size):
         logging.info("@@임베딩 캐시 저장 실패 코드검수.....!!@@")
 
     return embeddings
-
 
 def _calculate_similarity_for_pair(pair):
     global embeddings
@@ -326,6 +327,9 @@ def generate_negative_pairs(identity_map, num_pairs):
 
 def main(args):
     LOG_FILE = os.path.join(script_dir , f'{args.model}_result.log')
+    with open(f"{LOG_FILE}" , 'a') as log_file:
+        log_file.write(f"\n시작시간 : {datetime.now().strftime('%Y.%m.%d - %H:%M:%S')}\n")
+
     torch.backends.cudnn.benchmark = True
     np.random.seed(42)
     random.seed(42)
@@ -386,9 +390,9 @@ def main(args):
     backbone = torch.compile(backbone)
 
 
-    all_person_folders = sorted(os.listdir(args.data_path))
-    num_folders_to_process = len(all_person_folders) // 1
-    folders_to_process = all_person_folders[:num_folders_to_process]
+    ALL_PERSON_FOLDERS = sorted(os.listdir(args.data_path))
+    NUM_FOLDER_TO_PROCESS = len(ALL_PERSON_FOLDERS) // args.split
+    folders_to_process = ALL_PERSON_FOLDERS[:NUM_FOLDER_TO_PROCESS]
 
     logging.info(f"사람 클래스 수 : {len(folders_to_process)}")
 
@@ -402,6 +406,8 @@ def main(args):
     
     if not identity_map:
         raise ValueError("데이터셋에서 2개 이상의 이미지를 가진 인물을 찾지 못했습니다.")
+    
+    TOTAL_IMAGE_LEN = sum(len(v) for v in identity_map.values() if v is not None)
     logging.info(f"총 {len(identity_map)}명의 인물, {sum(len(v) for v in identity_map.values())}개의 이미지를 찾았습니다.")
 
     logging.info("\n평가에 사용할 동일 인물/다른 인물 쌍 생성을 준비합니다 (제너레이터 사용)...")
@@ -434,14 +440,13 @@ def main(args):
     import time
     start_time = time.time()
     with Pool(initializer=init_worker, initargs=(embeddings,)) as pool:
-
-        with open('similarity_for_pair.npy', 'wb') as f:
+        with open(os.path.join(script_dir, 'similarity_for_pair.npy') , 'wb') as f:
             pos_results_gen = pool.imap_unordered(_calculate_similarity_for_pair, positive_pairs_generator, chunksize=1000)
             for result in tqdm(pos_results_gen, total=num_positive_pairs, desc="동일 인물 쌍 계산 및 저장"):
                 if result is not None:
                     result.tofile(f)
 
-        with open('negative_for_pair.npy', 'wb') as f:
+        with open(os.path.join(script_dir , 'negative_for_pair.npy'), 'wb') as f:
             neg_results_gen = pool.imap_unordered(_calculate_similarity_for_pair, negative_pairs_generator, chunksize=1000)
             for result in tqdm(neg_results_gen, total=num_negative_pairs, desc="다른 인물 쌍 계산 및 저장"):
                 if result is not None:
@@ -450,9 +455,48 @@ def main(args):
     end_time = time.time() - start_time
     logging.info(f"유사도 계산 및 파일 작성 완료. 소요시간: {end_time:.5f}초")
 
-    import time
+    rank_1_accuracy, rank_5_accuracy, cmc_curve, max_rank, total_probes = calculate_identification_metrics(identity_map, embeddings)
+
+    if rank_1_accuracy is not None:
+            print(f"\n--- 얼굴 식별 성능 ---")
+            print(f"Rank-1 Accuracy: {rank_1_accuracy:.4f}")
+            print(f"Rank-5 Accuracy: {rank_5_accuracy:.4f}")
+            print(f"총 프로브 이미지 수: {total_probes}")
+
+            with open(LOG_FILE, 'a') as log_file:
+                log_file.write(f"\n얼굴 식별 성능:\n")
+                log_file.write(f"Rank-1 Accuracy: {rank_1_accuracy:.4f}\n")
+                log_file.write(f"Rank-5 Accuracy: {rank_5_accuracy:.4f}\n")
+                log_file.write(f"총 프로브 이미지 수: {total_probes}\n")
+                if cmc_curve is not None:
+                    log_file.write(f"CMC Curve (first 5 ranks): {cmc_curve[:5].tolist()}\n")
+                log_file.write("\n")
+
+            if cmc_curve is not None and max_rank > 0:
+                plt.figure(figsize=(8, 6))
+                plt.plot(np.arange(1, max_rank + 1), cmc_curve, marker='o', linestyle='-', markersize=4)
+                plt.xlim([1, min(max_rank, 20)]) # Show up to rank 20 or max_rank
+                plt.ylim([0.0, 1.05])
+                plt.xlabel('Rank (k)')
+                plt.ylabel('Accuracy')
+                plt.title(f'CMC Curve for {args.model}')
+                plt.grid(True)
+                cmc_plot_filename = f"_{args.model}_cmc_curve.png"
+                plt.savefig(cmc_plot_filename)
+                print(f"CMC 커브 그래프가 '{cmc_plot_filename}' 파일로 저장되었습니다.")
+    else:
+        print("\n--- 얼굴 식별 성능 ---")
+        print("얼굴 식별 성능을 계산할 수 없습니다 (유효한 프로브 이미지 부족).")
+
+    num_total_embeddings = len(embeddings)
+    num_valid_embeddings = sum(1 for v in embeddings.values() if v is not None)
+    num_none_embeddings = sum(1 for v in embeddings.values() if v is None)
+
+    del embeddings
+    gc.collect()
+
     start_time = time.time()
-    logging.info("파일에서 유사도 데이터를 로딩합니다 (NumPy 사용)...")
+    logging.info("파일에서 유사도 데이터를 로딩합니다 ...")
     try:
         pos_similarities = np.fromfile('similarity_for_pair.npy', dtype=np.float16)
         logging.info(f"동일 인물 유사도 로딩 완료: {len(pos_similarities)}개")
@@ -478,15 +522,6 @@ def main(args):
     pos_labels = pos_labels[pos_finite_mask]
     neg_labels = neg_labels[neg_finite_mask]
 
-
-    with open(LOG_FILE, 'a') as log_file:
-        log_file.write(f"현재시각 : {datetime.now().strftime('%Y.%m.%d - %H:%M:%S')}\n")
-        log_file.write(f"\n🔍 디버깅 정보:\n")
-        log_file.write(f"   - 전체 임베딩 수: {len(embeddings)}\n")
-        log_file.write(f"   - 유효한 임베딩 수: {sum(1 for v in embeddings.values() if v is not None)}\n")
-        log_file.write(f"   - None 임베딩 수: {sum(1 for v in embeddings.values() if v is None)}\n")
-        log_file.write(f"   - 양성 쌍 유사도 수 (필터링 후): {len(pos_similarities)}\n")
-        log_file.write(f"   - 음성 쌍 유사도 수 (필터링 후): {len(neg_similarities)}\n")
 
     print(f"\n--- 유사도 분포 분석 ---")
     if len(pos_similarities) > 0 and len(neg_similarities) > 0:
@@ -514,26 +549,54 @@ def main(args):
         print(f"   - 표준편차: {neg_std:.4f}" if isinstance(neg_std, (int, float)) else f"   - 표준편차: {neg_std}")
 
 
+
         with open(LOG_FILE, 'a') as log_file:
-            log_file.write(f"\n--- 유사도 분포 분석 ---")
-            log_file.write(f"🔵 동일 인물 쌍 유사도 (총 {len(pos_similarities):,}개):")
-            log_file.write(f"   - 최소값: {np.min(pos_similarities):.4f}")
-            log_file.write(f"   - 최대값: {np.max(pos_similarities):.4f}")
-            log_file.write(f"   - 평균값: {np.mean(pos_similarities.astype(np.float64)):.4f}")
-            log_file.write(f"   - 표준편차: {pos_std:.4f}" if isinstance(pos_std, (int, float)) else f"   - 표준편차: {pos_std}")
+            log_file.write(f"\n--- 유사도 분포 분석 ---\n")  
+            log_file.write(f"🔍 디버깅 정보:\n")          
+            log_file.write(f"   - 전체 임베딩 수: {num_total_embeddings}\n")
+            log_file.write(f"   - 유효한 임베딩 수: {num_valid_embeddings}\n")
+            log_file.write(f"   - None 임베딩 수: {num_none_embeddings}\n")
+            log_file.write(f"\n") 
+
+            log_file.write(f"🔵 동일 인물 쌍 유사도 (총 {len(pos_similarities):,}개):\n")
+            log_file.write(f"   - 최소값: {np.min(pos_similarities):.4f}\n")     
+            log_file.write(f"   - 최대값: {np.max(pos_similarities):.4f}\n")        
+            log_file.write(f"   - 평균값: {np.mean(pos_similarities.astype(np.float64)):.4f}\n") 
             
-            log_file.write(f"🔴 다른 인물 쌍 유사도 (총 {len(neg_similarities):,}개):")
-            log_file.write(f"   - 최소값: {np.min(neg_similarities):.4f}")
-            log_file.write(f"   - 최대값: {np.max(neg_similarities):.4f}")
-            log_file.write(f"   - 평균값: {np.mean(neg_similarities.astype(np.float64)):.4f}")
-            log_file.write(f"   - 표준편차: {neg_std:.4f}" if isinstance(neg_std, (int, float)) else f"   - 표준편차: {neg_std}")
+            if isinstance(pos_std, (int, float)):
+                log_file.write(f"   - 표준편차: {pos_std:.4f}\n")
+            else:
+                log_file.write(f"   - 표준편차: {pos_std}\n")
+            
+            log_file.write(f"\n")
+            log_file.write(f"🔴 다른 인물 쌍 유사도 (총 {len(neg_similarities):,}개):\n") 
+            log_file.write(f"   - 최소값: {np.min(neg_similarities):.4f}\n")        
+            log_file.write(f"   - 최대값: {np.max(neg_similarities):.4f}\n")         
+            log_file.write(f"   - 평균값: {np.mean(neg_similarities.astype(np.float64)):.4f}\n") 
+
+            if isinstance(neg_std, (int, float)):
+                log_file.write(f"   - 표준편차: {neg_std:.4f}\n")
+            else:
+                log_file.write(f"   - 표준편차: {neg_std}\n")
+            
+            log_file.write('\n')
+
     else:
         logging.info("유사도 데이터가 충분하지 않아 분포 분석을 수행할 수 없습니다.")
         logging.info(f"len pos : {len(pos_similarities)}, len neg: {len(neg_similarities)}")
         exit(0)
+
+    with open(LOG_FILE, 'a') as log_file:
+        log_file.write(f"   - 양성 쌍 유사도 수 (필터링 후): {len(pos_similarities)}\n")
+        log_file.write(f"   - 음성 쌍 유사도 수 (필터링 후): {len(neg_similarities)}\n")
     
+
+
     scores = np.concatenate([pos_similarities, neg_similarities])
     labels = np.concatenate([pos_labels, neg_labels])
+
+    del pos_similarities , neg_similarities , pos_labels , neg_labels
+    gc.collect()
 
     logging.info("\n--- 최종 평가 결과 ---")
     if labels.size > 0:
@@ -566,60 +629,33 @@ def main(args):
         
         with open(LOG_FILE, 'a') as log_file:
             log_file.write(f"\n평가 결과:\n")
+            log_file.write(f"전체 클래스수  : {NUM_FOLDER_TO_PROCESS} 전체 사람 이미지수 : {TOTAL_IMAGE_LEN}\n")
             log_file.write(f"ROC-AUC: {roc_auc:.4f}, EER: {eer:.4f} (Threshold: {eer_threshold:.4f})\n")
             log_file.write(f"Accuracy: {metrics['accuracy']:.4f}, Recall: {metrics['recall']:.4f}, F1-Score: {metrics['f1_score']:.4f}\n")
             for far, tar in tar_at_far_results.items():
                 log_file.write(f"TAR @ FAR {far*100:g}%: {tar:.4f}\n")
-            log_file.write("\n")  # 빈 줄 추가
+            log_file.write("\n")  
+            log_file.write(f"평가를 완료하였습니다 (종료시간) ---> {datetime.now().strftime('%Y.%m.%d - %H:%M:%S')}")
+            log_file.write("\n")
 
         excel_path = os.path.join(script_dir, args.excel_path)
         total_dataset_img_len = sum(len(v) for v in identity_map.values())
         total_class = len(identity_map)
-        
-        # Calculate identification metrics
-        rank_1_accuracy, rank_5_accuracy, cmc_curve, max_rank, total_probes = calculate_identification_metrics(identity_map, embeddings)
 
-        if rank_1_accuracy is not None:
-            print(f"\n--- 얼굴 식별 성능 ---")
-            print(f"Rank-1 Accuracy: {rank_1_accuracy:.4f}")
-            print(f"Rank-5 Accuracy: {rank_5_accuracy:.4f}")
-            print(f"총 프로브 이미지 수: {total_probes}")
+        try:
+            plot_roc_curve(fpr, tpr, roc_auc, args.model, excel_path)
+        except Exception as e:
+            logging.info(f"ROC Curve 이미지 저장 실패 {e}")
 
-            with open(LOG_FILE, 'a') as log_file:
-                log_file.write(f"\n얼굴 식별 성능:\n")
-                log_file.write(f"Rank-1 Accuracy: {rank_1_accuracy:.4f}\n")
-                log_file.write(f"Rank-5 Accuracy: {rank_5_accuracy:.4f}\n")
-                log_file.write(f"총 프로브 이미지 수: {total_probes}\n")
-                if cmc_curve is not None:
-                    log_file.write(f"CMC Curve (first 10 ranks): {cmc_curve[:10].tolist()}\n")
-                log_file.write("\n")
-
-            # Plot CMC Curve
-            if cmc_curve is not None and max_rank > 0:
-                plt.figure(figsize=(8, 6))
-                plt.plot(np.arange(1, max_rank + 1), cmc_curve, marker='o', linestyle='-', markersize=4)
-                plt.xlim([1, min(max_rank, 20)]) # Show up to rank 20 or max_rank
-                plt.ylim([0.0, 1.05])
-                plt.xlabel('Rank (k)')
-                plt.ylabel('Accuracy')
-                plt.title(f'CMC Curve for {args.model}')
-                plt.grid(True)
-                cmc_plot_filename = os.path.splitext(excel_path)[0] + f"_{args.model}_cmc_curve.png"
-                plt.savefig(cmc_plot_filename)
-                print(f"CMC 커브 그래프가 '{cmc_plot_filename}' 파일로 저장되었습니다.")
-        else:
-            print("\n--- 얼굴 식별 성능 ---")
-            print("얼굴 식별 성능을 계산할 수 없습니다 (유효한 프로브 이미지 부족).")
-            with open(LOG_FILE, 'a') as log_file:
-                log_file.write("\n얼굴 식별 성능:\n")
-                log_file.write("얼굴 식별 성능을 계산할 수 없습니다 (유효한 프로브 이미지 부족).\n")
-                log_file.write("\n")
-
-        save_results_to_excel(excel_path, args.model, roc_auc, eer, tar_at_far_results, \
+        try:
+            save_results_to_excel(excel_path, args.model, roc_auc, eer, tar_at_far_results, \
                               args.target_fars, metrics, total_dataset_img_len, total_class, args.data_path, args.model, \
                               rank_1_accuracy, rank_5_accuracy)
+        except Exception as e:
+            logging.info(f"EXCEL SAVE 저장 실패 {e}")
 
-        plot_roc_curve(fpr, tpr, roc_auc, args.model, excel_path)
+        logging.info(f"평가를 완료하였습니다 (종료시간) ---> {datetime.now().strftime('%Y.%m.%d - %H:%M:%S')}")
+
     else:
         msg = "평가를 위한 유효한 점수를 수집하지 못했습니다."
         print(msg)
@@ -627,7 +663,8 @@ def main(args):
 
 def save_results_to_excel(excel_path, model_name, roc_auc, eer, tar_at_far_results, target_fars, metrics, total_dataset_img_len, total_class,
                            data_path, model_attr_value, rank_1_accuracy=None, rank_5_accuracy=None):
-    """결과를 Excel 파일에 저장합니다."""
+
+
     new_data = {
         "model_name": [model_name],
         "roc_auc": [f"{roc_auc:.4f}"], "eer": [f"{eer:.4f}"],
@@ -681,7 +718,7 @@ def plot_roc_curve(fpr, tpr, roc_auc, model_name, excel_path):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="SEvaluation Script")
-    parser.add_argument('--model',type=str , default='Glint360K_R200_TopoFR', choices=['Glint360K_R50_TopoFR_9727', 'Glint360K_R200_TopoFR', 'MS1MV2_R200_TopoFR', 'Glint360K_R100_TopoFR_9760'],)
+    parser.add_argument('--model',type=str , default='Glint360K_R50_TopoFR_9727', choices=['Glint360K_R50_TopoFR_9727', 'Glint360K_R200_TopoFR', 'MS1MV2_R200_TopoFR', 'Glint360K_R100_TopoFR_9760'],)
     parser.add_argument("--data_path", type=str, default="/home/ubuntu/KOR_DATA/일반/kor_data_sorting", help="평가할 데이터셋의 루트 폴더")
     parser.add_argument("--excel_path", type=str, default="evaluation_results.xlsx", help="결과를 저장할 Excel 파일 이름")
     parser.add_argument("--target_fars", nargs='+', type=float, default=[0.01, 0.001, 0.0001], help="TAR을 계산할 FAR 목표값들")
@@ -689,6 +726,7 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=512, help="임베딩 추출 시 배치 크기")
     parser.add_argument('--load_cache' , type=str , default = None ,help="임베딩 캐시경로")
     parser.add_argument('--save_cache' , action='store_true')
+    parser.add_argument('--split',default=2 , help='전체클래스수 / N ')
     args = parser.parse_args()
 
     #args.data_path = '/home/ubuntu/KOR_DATA/kor_data_full_Middle_Resolution_aligend'
