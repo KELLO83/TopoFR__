@@ -5,6 +5,8 @@
 *.xlsx
 *.npy
 
+
+python_consumer_producer
 # .gitignore 파일은 무시하지 않음
 !.gitignore
 
@@ -159,3 +161,4 @@ node_modules/
 .npm
 .node_repl_history
 
+Q.py
