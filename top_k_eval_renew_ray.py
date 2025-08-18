@@ -84,7 +84,6 @@ def find_max_batch_size(model, input_shape, device):
         
     return max_batch_size
 
-
 def init_identification_worker(worker_embeddings, gallery_embs_np, gallery_ids):
 
     global g_embeddings, g_gallery_embeddings_np, g_gallery_identities_ordered
@@ -188,9 +187,7 @@ def get_all_embeddings(identity_map, backbone, batch_size):
 
     return embeddings
 
-
-@ray.remote
-def _calculate_similarity_for_pair_images(pair , embeddings):
+def _calculate_similarity_for_pair_images__(pair , embeddings):
 
     img1_path, img2_path = pair
     
@@ -211,7 +208,7 @@ def _calculate_similarity_for_pair_images(pair , embeddings):
     return None
 
 def calculate_identification_metrics(identity_map, embeddings):
-    logging.info("Calculating identification metrics (Rank-k, CMC)...")
+    logging.info("Calculating identification metrics (Rank-k, CMC).")
 
     gallery_images = {} 
     probe_images_with_labels = []
@@ -307,32 +304,7 @@ def calculate_identification_metrics(identity_map, embeddings):
 
     return rank_1_accuracy, rank_5_accuracy, cmc_curve, max_rank, total_probes
 
-def generate_positive_pairs_embs(identity_map, embeddings ):
-    for imgs in identity_map.values():
-        for path1, path2 in itertools.combinations(imgs, 2):
-            emb1 = embeddings.get(path1)
-            emb2 = embeddings.get(path2)
-            if emb1 is not None and emb2 is not None:
-                yield (emb1, emb2)
-
-def generate_negative_pairs_embs(identity_map , embeddings , num_pairs):
-    identities = list(identity_map.keys())
-    if len(identities) < 2:
-        return
-    
-    for _ in range(num_pairs):
-        id1, id2 = random.sample(identities, 2)
-        img1 = random.choice(identity_map[id1])
-        img2 = random.choice(identity_map[id2])
-
-        emb1 = embeddings.get(img1)
-        emb2 = embeddings.get(img2)
-        
-        if emb1 is not None and emb2 is not None:
-            yield (emb1 , emb2)
-
 def generate_positive_pairs(identity_map):
-    """동일 인물 쌍을 생성하는 제너레이터"""
     for imgs in identity_map.values():
         for pair in itertools.combinations(imgs, 2):
             yield pair
@@ -349,8 +321,13 @@ def generate_negative_pairs(identity_map, num_pairs):
         img2 = random.choice(identity_map[id2])
         yield (img1, img2)
 
-
 def ray_imap_unordered(func, iterable, *args):
+    """
+
+    함수 -> _calculate_similarity_for_pair_images
+    이터러블 -> positive_pairs_batches
+    args -> embeddings_ref
+    """
     max_inflight = os.cpu_count()
     futures = []
     iterator = iter(iterable)
@@ -360,16 +337,81 @@ def ray_imap_unordered(func, iterable, *args):
             try:
                 item = next(iterator)
                 futures.append(func.remote(item, *args))
-                
+                # item 10개의 이미지경로 리스트로전달 
+                #[('/home/ubuntu/KOR_DATA/일반/kor_data_sorting/19062421/63.jpg', '/home/ubuntu/KOR_DATA/일반/kor_data_sorting/19062421/145.jpg') , ...]
             except StopIteration:
                 break
         
         if not futures:
             break
             
-        ready, futures = ray.wait(futures)
-        for future in ready:
-            yield ray.get(future)
+        # Wait for one future to be ready to better control memory usage.
+        ready, futures = ray.wait(futures, num_returns=1)
+        
+        if ready:
+            # Since num_returns=1, 'ready' will have at most one element.
+            result = ray.get(ready[0])
+            yield result
+            # Explicitly delete references to help with garbage collection and
+            # prevent potential memory leaks when dealing with large datasets.
+            del result
+            del ready
+
+def chunked_generator(generator, chunk_size):
+    """Generates chunks from a generator."""
+    chunk = []
+    for item in generator:
+        chunk.append(item)
+        if len(chunk) == chunk_size:
+            yield chunk
+            chunk = []
+    if chunk:
+        yield chunk
+
+@ray.remote
+def _calculate_similarity_for_pair_images(pairs_batch, embeddings):
+    """Calculates similarities for a batch of image pairs using vectorized operations."""
+    img1_paths, img2_paths = zip(*pairs_batch)
+    
+    emb1s = [embeddings.get(p) for p in img1_paths]
+    emb2s = [embeddings.get(p) for p in img2_paths]
+    
+    valid_indices = [i for i, (e1, e2) in enumerate(zip(emb1s, emb2s)) if e1 is not None and e2 is not None]
+    
+    results = [None] * len(pairs_batch)
+    
+    if not valid_indices:
+        return results
+        
+    valid_emb1s = torch.stack([emb1s[i] for i in valid_indices]).to(torch.float32)
+    valid_emb2s = torch.stack([emb2s[i] for i in valid_indices]).to(torch.float32)
+    
+    norm1 = torch.norm(valid_emb1s, dim=1)
+    norm2 = torch.norm(valid_emb2s, dim=1)
+    
+    dot_product = torch.sum(valid_emb1s * valid_emb2s, dim=1)
+    
+    # Initialize similarities for valid pairs with a placeholder (e.g., NaN)
+    similarities = torch.full_like(dot_product, fill_value=float('nan'))
+    
+    # Create a mask for pairs with valid norms
+    valid_norms_mask = (norm1 > 0) & (norm2 > 0)
+    
+    # Calculate cosine similarity only for pairs with valid norms
+    if torch.any(valid_norms_mask):
+        similarities[valid_norms_mask] = dot_product[valid_norms_mask] / (norm1[valid_norms_mask] * norm2[valid_norms_mask])
+    
+    similarities_np = similarities.cpu().numpy().astype(np.float16)
+    
+    # Place calculated similarities back into the results list at their original positions
+    for i, original_idx in enumerate(valid_indices):
+        # Only store finite values, otherwise it stays None
+        if np.isfinite(similarities_np[i]):
+            results[original_idx] = similarities_np[i]
+            
+    return results
+            
+
 
 def main(args):
     LOG_FILE = os.path.join(script_dir , f'{args.model}_result.log')
@@ -390,7 +432,9 @@ def main(args):
     )
 
 
-    ray.init(num_cpus = os.cpu_count())
+    ray.init(
+        num_cpus = os.cpu_count(),
+        )
     
     if not os.path.isdir(args.data_path):
         raise FileNotFoundError(f"데이터셋 경로를 찾을 수 없습니다: {args.data_path}")
@@ -493,23 +537,42 @@ def main(args):
     # ray 공유메모리 임베딩값 적재
     embeddings_ref = ray.put(embeddings)
 
+    num_total_embeddings = len(embeddings)
+    num_valid_embeddings = sum(1 for v in embeddings.values() if v is not None)
+    num_none_embeddings = sum(1 for v in embeddings.values() if v is None)
+    total_dataset_img_len = sum(len(v) for v in identity_map.values())
+    total_class = len(identity_map)
 
+    del embeddings
+
+    PAIR_BATCH_SIZE = 10  # 각 Ray 작업에서 처리할 쌍의 수. 메모리 사용량에 따라 이 값을 조정할 수 있습니다.
     with open(os.path.join(script_dir, 'positive_for_pair.npy'), 'wb') as f:
-        neg_results_gen = ray_imap_unordered(_calculate_similarity_for_pair_images, negative_pairs_generator, embeddings_ref)
-        for result in tqdm(neg_results_gen, total=num_negative_pairs, desc="다른 인물 쌍 계산 및 저장 (Ray)"):
-            if result is not None:
-                result.tofile(f)
+        positive_pairs_batches = chunked_generator(positive_pairs_generator, PAIR_BATCH_SIZE)
+        num_batches = (num_positive_pairs + PAIR_BATCH_SIZE - 1) // PAIR_BATCH_SIZE
+        
+        results_gen = ray_imap_unordered(_calculate_similarity_for_pair_images, positive_pairs_batches, embeddings_ref)
+        
+        for batch_results in tqdm(results_gen, total=num_batches, desc="동일 인물 쌍 계산 및 저장 (Ray)"):
+            for result in batch_results:
+                if result is not None:
+                    result.tofile(f)
 
     with open(os.path.join(script_dir, 'negative_for_pair.npy'), 'wb') as f:
-        neg_results_gen = ray_imap_unordered(_calculate_similarity_for_pair_images, negative_pairs_generator, embeddings_ref)
-        for result in tqdm(neg_results_gen, total=num_negative_pairs, desc="다른 인물 쌍 계산 및 저장 (Ray)"):
-            if result is not None:
-                result.tofile(f)
+        negative_pairs_batches = chunked_generator(negative_pairs_generator, PAIR_BATCH_SIZE)
+        num_batches = (num_negative_pairs + PAIR_BATCH_SIZE - 1) // PAIR_BATCH_SIZE
+
+        results_gen = ray_imap_unordered(_calculate_similarity_for_pair_images, negative_pairs_batches, embeddings_ref)
+
+        for batch_results in tqdm(results_gen, total=num_batches, desc="다른 인물 쌍 계산 및 저장 (Ray)"):
+            for result in batch_results:
+                if result is not None:
+                    result.tofile(f)
 
 
     end_time = time.time() - start_time
     logging.info(f"유사도 계산 및 파일 작성 완료. 소요시간: {end_time:.5f}초")
 
+    embeddings = ray.get(embeddings_ref)
     rank_1_accuracy, rank_5_accuracy, cmc_curve, max_rank, total_probes = calculate_identification_metrics(identity_map, embeddings)
 
     if rank_1_accuracy is not None:
@@ -543,13 +606,6 @@ def main(args):
         print("\n--- 얼굴 식별 성능 ---")
         print("얼굴 식별 성능을 계산할 수 없습니다 (유효한 프로브 이미지 부족).")
 
-    num_total_embeddings = len(embeddings)
-    num_valid_embeddings = sum(1 for v in embeddings.values() if v is not None)
-    num_none_embeddings = sum(1 for v in embeddings.values() if v is None)
-    total_dataset_img_len = sum(len(v) for v in identity_map.values())
-    total_class = len(identity_map)
-
-    del embeddings
     del identity_map
     gc.collect()
 
@@ -609,33 +665,33 @@ def main(args):
 
 
         with open(LOG_FILE, 'a') as log_file:
-            log_file.write(f"\n--- 유사도 분포 분석 ---\n")  
-            log_file.write(f"🔍 디버깅 정보:\n")          
-            log_file.write(f"   - 전체 임베딩 수: {num_total_embeddings}\n")
-            log_file.write(f"   - 유효한 임베딩 수: {num_valid_embeddings}\n")
-            log_file.write(f"   - None 임베딩 수: {num_none_embeddings}\n")
+            log_file.write(f"\n--- 유사도 분포 분석 ---")  
+            log_file.write(f"🔍 디버깅 정보:")          
+            log_file.write(f"   - 전체 임베딩 수: {num_total_embeddings}")
+            log_file.write(f"   - 유효한 임베딩 수: {num_valid_embeddings}")
+            log_file.write(f"   - None 임베딩 수: {num_none_embeddings}")
             log_file.write(f"\n") 
 
-            log_file.write(f"🔵 동일 인물 쌍 유사도 (총 {len(pos_similarities):,}개):\n")
-            log_file.write(f"   - 최소값: {np.min(pos_similarities):.4f}\n")     
-            log_file.write(f"   - 최대값: {np.max(pos_similarities):.4f}\n")        
-            log_file.write(f"   - 평균값: {np.mean(pos_similarities.astype(np.float64)):.4f}\n") 
+            log_file.write(f"🔵 동일 인물 쌍 유사도 (총 {len(pos_similarities):,}개):")
+            log_file.write(f"   - 최소값: {np.min(pos_similarities):.4f}")     
+            log_file.write(f"   - 최대값: {np.max(pos_similarities):.4f}")        
+            log_file.write(f"   - 평균값: {np.mean(pos_similarities.astype(np.float64)):.4f}") 
             
             if isinstance(pos_std, (int, float)):
-                log_file.write(f"   - 표준편차: {pos_std:.4f}\n")
+                log_file.write(f"   - 표준편차: {pos_std:.4f}")
             else:
-                log_file.write(f"   - 표준편차: {pos_std}\n")
+                log_file.write(f"   - 표준편차: {pos_std}")
             
             log_file.write(f"\n")
-            log_file.write(f"🔴 다른 인물 쌍 유사도 (총 {len(neg_similarities):,}개):\n") 
-            log_file.write(f"   - 최소값: {np.min(neg_similarities):.4f}\n")        
-            log_file.write(f"   - 최대값: {np.max(neg_similarities):.4f}\n")         
-            log_file.write(f"   - 평균값: {np.mean(neg_similarities.astype(np.float64)):.4f}\n") 
+            log_file.write(f"🔴 다른 인물 쌍 유사도 (총 {len(neg_similarities):,}개):") 
+            log_file.write(f"   - 최소값: {np.min(neg_similarities):.4f}")        
+            log_file.write(f"   - 최대값: {np.max(neg_similarities):.4f}")         
+            log_file.write(f"   - 평균값: {np.mean(neg_similarities.astype(np.float64)):.4f}") 
 
             if isinstance(neg_std, (int, float)):
-                log_file.write(f"   - 표준편차: {neg_std:.4f}\n")
+                log_file.write(f"   - 표준편차: {neg_std:.4f}")
             else:
-                log_file.write(f"   - 표준편차: {neg_std}\n")
+                log_file.write(f"   - 표준편차: {neg_std}")
             
             log_file.write('\n')
 
@@ -645,8 +701,8 @@ def main(args):
         exit(0)
 
     with open(LOG_FILE, 'a') as log_file:
-        log_file.write(f"   - 양성 쌍 유사도 수 (필터링 후): {len(pos_similarities)}\n")
-        log_file.write(f"   - 음성 쌍 유사도 수 (필터링 후): {len(neg_similarities)}\n")
+        log_file.write(f"   - 양성 쌍 유사도 수 (필터링 후): {len(pos_similarities)}")
+        log_file.write(f"   - 음성 쌍 유사도 수 (필터링 후): {len(neg_similarities)}")
     
 
 
@@ -774,7 +830,7 @@ def plot_roc_curve(fpr, tpr, roc_auc, model_name, excel_path):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="SEvaluation Script")
-    parser.add_argument('--model',type=str , default='Glint360K_R200_TopoFR', choices=['Glint360K_R200_TopoFR' , 'Glint360K_R50_TopoFR_9727', 'MS1MV2_R200_TopoFR', 'Glint360K_R100_TopoFR_9760'],)
+    parser.add_argument('--model',type=str , default='Glint360K_R50_TopoFR_9727', choices=['Glint360K_R200_TopoFR' , 'Glint360K_R50_TopoFR_9727', 'MS1MV2_R200_TopoFR', 'Glint360K_R100_TopoFR_9760'],)
     parser.add_argument("--data_path", type=str, default="/home/ubuntu/KOR_DATA/일반/kor_data_sorting", help="평가할 데이터셋의 루트 폴더")
     parser.add_argument("--excel_path", type=str, default="evaluation_results.xlsx", help="결과를 저장할 Excel 파일 이름")
     parser.add_argument("--target_fars", nargs='+', type=float, default=[0.01, 0.001, 0.0001], help="TAR을 계산할 FAR 목표값들")
@@ -782,7 +838,7 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=512, help="임베딩 추출 시 배치 크기")
     parser.add_argument('--load_cache' , type=str , default = None ,help="임베딩 캐시경로")
     parser.add_argument('--save_cache' , action='store_true')
-    parser.add_argument('--split',default=1 , help='전체클래스수 / N ')
+    parser.add_argument('--split',default=10 , help='전체클래스수 / N ')
     args = parser.parse_args()
 
     #args.data_path = '/home/ubuntu/KOR_DATA/kor_data_full_Middle_Resolution_aligend'
