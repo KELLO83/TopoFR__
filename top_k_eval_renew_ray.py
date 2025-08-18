@@ -8,24 +8,25 @@ import cv2
 from tqdm import tqdm
 from sklearn.metrics import roc_curve, auc, confusion_matrix
 import logging
-import traceback
-import pickle
 import argparse
 import matplotlib.pyplot as plt
+import logging
 import torchvision.transforms.v2 as v2
-from PIL import Image
+import numpy as np
 from backbones.iresnet import IResNet , IBasicBlock
-from multiprocessing.pool import Pool
-import multiprocessing
-from itertools import islice
+
 from datetime import datetime
 from torch.utils.data import Dataset , DataLoader
-
+import gc
+import sys
+import ray
 try:
     script_dir = os.path.dirname(os.path.abspath(__file__))
 except NameError:
     script_dir = os.getcwd()
 
+print(f"script dir ---> {script_dir}")
+print(f"python version {sys.version}")
 class Dataset_load(Dataset):
     def __init__(self, identity_map):
         super().__init__()
@@ -48,6 +49,41 @@ class Dataset_load(Dataset):
         image_tensor = self.transform(image)
         return image_tensor, image_path
     
+def find_max_batch_size(model, input_shape, device):
+    if device != 'cuda':
+        logging.info("CUDA 발견 실패 MAX Batch SIZE 탐색 실패")
+        return None
+    
+    model.to(device)
+    model.eval()
+
+    batch_size = 512
+    max_batch_size = 0
+
+    while True:
+        try:
+            dummy_input = torch.randn(batch_size, *input_shape).to(device)
+
+            with torch.no_grad():
+                _ = model(dummy_input)
+            max_batch_size = batch_size
+            print(f"✅ 배치 사이즈 {batch_size} 성공")
+            batch_size *= 2 
+
+        except RuntimeError as e:
+            if 'out of memory' in str(e).lower():
+                print(f"❌ 배치 사이즈 {batch_size}에서 메모리 부족 발생")
+                torch.cuda.empty_cache()
+                break
+            else:
+                raise e
+            
+        if batch_size > 2048 * 5:
+                print("안전 제한 도달. 탐색을 중단합니다.")
+                break
+        
+    return max_batch_size
+
 
 def init_identification_worker(worker_embeddings, gallery_embs_np, gallery_ids):
 
@@ -64,14 +100,18 @@ def _evaluate_probe_worker(probe_data):
     if probe_emb is None:
         return -1  
 
-    norm_val = np.linalg.norm(probe_emb)
+    # Convert probe to float32 numpy array for calculation
+    probe_emb_f32 = probe_emb.numpy().astype(np.float32)
+    
+    norm_val = np.linalg.norm(probe_emb_f32)
     if norm_val == 0:
         return -1
-    probe_emb_norm = probe_emb / norm_val
+    probe_emb_norm = probe_emb_f32 / norm_val
 
     if not np.all(np.isfinite(probe_emb_norm)):
         return -1
 
+    # g_gallery_embeddings_np is already float32 from calculate_identification_metrics
     similarities = np.dot(g_gallery_embeddings_np, probe_emb_norm)
     ranked_indices = np.argsort(similarities)[::-1]
     ranked_identities = np.array(g_gallery_identities_ordered)[ranked_indices]
@@ -94,13 +134,18 @@ transforms_v2 = v2.Compose([
 ])
 
 @torch.inference_mode()
-def get_all_embeddings(identity_map, backbone, device, batch_size):
+def get_all_embeddings(identity_map, backbone, batch_size):
     
     logging.info(f"임베딩 추출 시작 ( 배치사이즈: {batch_size})")
 
-    if isinstance(device, str):
-        device = torch.device(device)
-    
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    logging.info(f"현재 사용 장치: {device}")
+    logging.info(f"장치 타입: {device.type}")
+
+    if device.type == 'cpu':
+        input("\nCPU 추론을 진행합니다. 계속하시려면 아무 키나 입력하세요...")
+
     backbone = backbone.to(device)
     backbone.eval()
     
@@ -110,7 +155,7 @@ def get_all_embeddings(identity_map, backbone, device, batch_size):
         dataset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=os.cpu_count() if os.cpu_count() is not None else 8,
+        num_workers=os.cpu_count(),
         pin_memory=True, 
     )
 
@@ -125,15 +170,16 @@ def get_all_embeddings(identity_map, backbone, device, batch_size):
             vectors = output[1] if isinstance(output, tuple) else output
             
         if vectors is not None and vectors.numel() > 0:
-            vectors_cpu = vectors.cpu().numpy()
+            vectors_cpu = vectors.cpu()
             for path, vector in zip(batch_paths, vectors_cpu):
-                embeddings[path] = vector.flatten()
+                embeddings[path] = vector.to(torch.float16).flatten()
 
 
     try:
         if args.save_cache:
             file_name = f'{args.model}.npz'
-            np.savez_compressed(file_name, **embeddings)
+            embeddings_np = {k: v.cpu().numpy() for k, v in embeddings.items()}
+            np.savez_compressed(file_name, **embeddings_np)
             logging.info(f"임베딩 캐시 저장완료 파일이름 : {file_name}")
         
     except Exception as e:
@@ -142,59 +188,27 @@ def get_all_embeddings(identity_map, backbone, device, batch_size):
 
     return embeddings
 
-def collect_scores_from_embeddings(pairs, embeddings, is_positive, total_pairs=None):
-    """임베딩으로 유사도를 계산합니다 (코사인 유사도 사용)."""
-    similarities, labels = [], []
-    label = 1 if is_positive else 0
-    desc = "동일 인물 쌍 계산" if is_positive else "다른 인물 쌍 계산"
 
-    if total_pairs is None:
-        try:
-            total_pairs = len(pairs)
-        except TypeError:
-            total_pairs = None 
+@ray.remote
+def _calculate_similarity_for_pair_images(pair , embeddings):
 
-    for img1_path, img2_path in tqdm(pairs, desc=desc, total=total_pairs):
-        emb1, emb2 = embeddings.get(img1_path), embeddings.get(img2_path)
-        if emb1 is not None and emb2 is not None:
-        
-            norm1 = np.linalg.norm(emb1)
-            norm2 = np.linalg.norm(emb2)
-            
-            if norm1 == 0 or norm2 == 0:
-                logging.warning(f"Zero norm embedding found: {img1_path} or {img2_path}")
-                continue
-            
-            emb1_norm = emb1 / norm1
-            emb2_norm = emb2 / norm2
-            cosine_similarity = np.dot(emb1_norm, emb2_norm)
-            
-            if np.isfinite(cosine_similarity):
-                similarities.append(cosine_similarity)
-                labels.append(label)
-            else:
-                logging.warning(f"Invalid similarity computed: {cosine_similarity}")
-    
-    return similarities, labels
-
-def _calculate_similarity_for_pair(pair):
-    """한 쌍의 이미지에 대한 유사도를 계산합니다. (워커 프로세스용)"""
-    # init_worker에 의해 설정된 전역 변수 embeddings를 사용합니다.
-    global embeddings
     img1_path, img2_path = pair
     
     emb1 = embeddings.get(img1_path)
     emb2 = embeddings.get(img2_path)
     
     if emb1 is not None and emb2 is not None:
-        norm1 = np.linalg.norm(emb1)
-        norm2 = np.linalg.norm(emb2)
+        emb1 = emb1.to(torch.float32)
+        emb2 = emb2.to(torch.float32)
+
+        norm1 = torch.norm(emb1)
+        norm2 = torch.norm(emb2)
+
         if norm1 > 0 and norm2 > 0:
-            # 정규화와 내적을 한 번에 계산
-            cosine_similarity = np.dot(emb1, emb2) / (norm1 * norm2)
-            if np.isfinite(cosine_similarity):
-                return cosine_similarity
-    return None # 계산 실패 시 None 반환
+            cosine_similarity = torch.dot(emb1, emb2) / (norm1 * norm2)
+            return cosine_similarity.cpu().numpy().astype(np.float16)
+            
+    return None
 
 def calculate_identification_metrics(identity_map, embeddings):
     logging.info("Calculating identification metrics (Rank-k, CMC)...")
@@ -239,10 +253,10 @@ def calculate_identification_metrics(identity_map, embeddings):
         img_path = gallery_images[identity]
         emb = embeddings.get(img_path)
         if emb is not None:
-            norm = np.linalg.norm(emb)
+            norm = torch.norm(emb)
             if norm > 0:
-                norm_emb = emb / norm
-                if np.all(np.isfinite(norm_emb)):
+                norm_emb = torch.div(emb , norm)
+                if torch.all(torch.isfinite(norm_emb)):
                     gallery_embeddings.append(norm_emb)
                     gallery_identities_ordered.append(identity)
                 else:
@@ -256,7 +270,7 @@ def calculate_identification_metrics(identity_map, embeddings):
         logging.error("No valid gallery embeddings found. Cannot perform identification evaluation.")
         return None, None, None, None, None
 
-    gallery_embeddings_np = np.array(gallery_embeddings)
+    gallery_embeddings_np = torch.stack(gallery_embeddings).cpu().numpy().astype(np.float32)
 
     max_rank = len(gallery_identities_ordered) 
     if max_rank == 0: 
@@ -293,68 +307,75 @@ def calculate_identification_metrics(identity_map, embeddings):
 
     return rank_1_accuracy, rank_5_accuracy, cmc_curve, max_rank, total_probes
 
-def process_pair_chunk(pair_chunk):
-    local_negative_pairs_set = set()
-    for img_info1, img_info2 in pair_chunk:
-        if img_info1['id'] != img_info2['id']:
-            pair = tuple(sorted((img_info1['path'], img_info2['path'])))
-            local_negative_pairs_set.add(pair)
-    return local_negative_pairs_set
+def generate_positive_pairs_embs(identity_map, embeddings ):
+    for imgs in identity_map.values():
+        for path1, path2 in itertools.combinations(imgs, 2):
+            emb1 = embeddings.get(path1)
+            emb2 = embeddings.get(path2)
+            if emb1 is not None and emb2 is not None:
+                yield (emb1, emb2)
 
-def generate_negative_pairs_parallel(identity_map, num_target_pairs, num_cpus):
-    """
-    멀티코어를 사용하여 다른 인물 쌍(negative pairs)을 병렬로 생성합니다.
-    """
-    logging.info("이미지 목록 생성 중...")
-    all_images_with_id = []
-    person_to_int_id = {person_folder: i for i, person_folder in enumerate(identity_map.keys())}
-    for person_folder, image_paths in identity_map.items():
-        person_id = person_to_int_id[person_folder]
-        for path in image_paths:
-            all_images_with_id.append({'id': person_id, 'path': path})
+def generate_negative_pairs_embs(identity_map , embeddings , num_pairs):
+    identities = list(identity_map.keys())
+    if len(identities) < 2:
+        return
     
-    random.shuffle(all_images_with_id)
-    logging.info(f"총 {len(all_images_with_id)}개 이미지에 대한 쌍 생성 시작...")
+    for _ in range(num_pairs):
+        id1, id2 = random.sample(identities, 2)
+        img1 = random.choice(identity_map[id1])
+        img2 = random.choice(identity_map[id2])
 
-    # 청크 사이즈는 각 코어가 한 번에 처리할 작업량입니다.
-    # 이 값이 너무 크면 -> 메인 프로세스가 청크를 만드는 데 시간이 걸려 다른 코어들이 대기하게 됩니다.
-    # 이 값이 너무 작으면 -> 코어들이 너무 자주 메인 프로세스와 통신해야 해서 오버헤드가 발생합니다.
-    # 시스템 환경과 데이터셋 크기에 따라 10,000 ~ 100,000 사이의 값으로 튜닝하면 좋습니다.
-    chunk_size = 20000
+        emb1 = embeddings.get(img1)
+        emb2 = embeddings.get(img2)
+        
+        if emb1 is not None and emb2 is not None:
+            yield (emb1 , emb2)
+
+def generate_positive_pairs(identity_map):
+    """동일 인물 쌍을 생성하는 제너레이터"""
+    for imgs in identity_map.values():
+        for pair in itertools.combinations(imgs, 2):
+            yield pair
+
+def generate_negative_pairs(identity_map, num_pairs):
+    """다른 인물 쌍을 생성하는 제너레이터 (중복 허용)"""
+    identities = list(identity_map.keys())
+    if len(identities) < 2:
+        return
+
+    for _ in range(num_pairs):
+        id1, id2 = random.sample(identities, 2)
+        img1 = random.choice(identity_map[id1])
+        img2 = random.choice(identity_map[id2])
+        yield (img1, img2)
+
+
+def ray_imap_unordered(func, iterable, *args):
+    max_inflight = os.cpu_count()
+    futures = []
+    iterator = iter(iterable)
     
-    pair_generator = itertools.combinations(all_images_with_id, 2)
-    master_set = set()
-
-    with multiprocessing.Pool(processes=num_cpus) as pool:
-        with tqdm(total=num_target_pairs, desc=f"쌍 생성 중 ({num_cpus} 코어)") as pbar:
-            chunk_generator = iter(lambda: list(islice(pair_generator, chunk_size)), [])
+    while True:
+        while len(futures) < max_inflight:
+            try:
+                item = next(iterator)
+                futures.append(func.remote(item, *args))
+                
+            except StopIteration:
+                break
+        
+        if not futures:
+            break
             
-            for result_set in pool.imap_unordered(process_pair_chunk, chunk_generator):
-                
-                original_size = len(master_set)
-                master_set.update(result_set)
-                newly_added_count = len(master_set) - original_size
-                
-                pbar.update(newly_added_count)
-                
-                if len(master_set) >= num_target_pairs:
-                    pbar.n = pbar.total
-                    pbar.refresh()
-                    logging.info(f"\n목표치({num_target_pairs}) 달성! 새로운 작업을 중단하고 현재 진행중인 작업이 끝나기를 기다립니다...")
-                    break
-    
-    logging.info(f"\n총 {len(master_set)}개의 고유한 쌍을 찾았습니다. 목표 개수로 조정합니다...")
-    if len(master_set) > num_target_pairs:
-        final_pairs = random.sample(list(master_set), num_target_pairs)
-    else:
-        final_pairs = list(master_set)
-        if len(final_pairs) < num_target_pairs:
-             logging.warning(f"경고: 가능한 모든 쌍({len(final_pairs)}개)을 찾았지만, 목표({num_target_pairs}개)보다 적습니다.")
-
-    return final_pairs
+        ready, futures = ray.wait(futures)
+        for future in ready:
+            yield ray.get(future)
 
 def main(args):
     LOG_FILE = os.path.join(script_dir , f'{args.model}_result.log')
+    with open(f"{LOG_FILE}" , 'a') as log_file:
+        log_file.write(f"\n시작시간 : {datetime.now().strftime('%Y.%m.%d - %H:%M:%S')}\n")
+
     torch.backends.cudnn.benchmark = True
     np.random.seed(42)
     random.seed(42)
@@ -367,6 +388,9 @@ def main(args):
             logging.StreamHandler()
         ]
     )
+
+
+    ray.init(num_cpus = os.cpu_count())
     
     if not os.path.isdir(args.data_path):
         raise FileNotFoundError(f"데이터셋 경로를 찾을 수 없습니다: {args.data_path}")
@@ -405,11 +429,19 @@ def main(args):
         logging.info("종료../")
         exit(0)
 
+    MAX_BATCH_SIZE = find_max_batch_size(backbone , (3,112,112) , device = 'cuda' if torch.cuda.is_available() else 'cpu')
+    gc.collect()
+    torch.cuda.empty_cache()
+    if MAX_BATCH_SIZE is not None:
+        args.batch_size = MAX_BATCH_SIZE // 2
+        logging.info(f"배치사이즈 변경(최대치) : {MAX_BATCH_SIZE // 2}")
+
     backbone = torch.compile(backbone)
 
-    all_person_folders = sorted(os.listdir(args.data_path))
-    num_folders_to_process = len(all_person_folders) // 1
-    folders_to_process = all_person_folders[:num_folders_to_process]
+
+    ALL_PERSON_FOLDERS = sorted(os.listdir(args.data_path))
+    NUM_FOLDER_TO_PROCESS = len(ALL_PERSON_FOLDERS) // args.split
+    folders_to_process = ALL_PERSON_FOLDERS[:NUM_FOLDER_TO_PROCESS]
 
     logging.info(f"사람 클래스 수 : {len(folders_to_process)}")
 
@@ -423,65 +455,122 @@ def main(args):
     
     if not identity_map:
         raise ValueError("데이터셋에서 2개 이상의 이미지를 가진 인물을 찾지 못했습니다.")
+    
+    TOTAL_IMAGE_LEN = sum(len(v) for v in identity_map.values() if v is not None)
     logging.info(f"총 {len(identity_map)}명의 인물, {sum(len(v) for v in identity_map.values())}개의 이미지를 찾았습니다.")
 
-    logging.info("\n평가에 사용할 동일 인물/다른 인물 쌍을 생성합니다...")
+    logging.info("\n평가에 사용할 동일 인물/다른 인물 쌍 생성을 준비합니다 (제너레이터 사용)...")
+
     
-    positive_pairs = []
-    for imgs in tqdm(identity_map.values(), desc="동일 인물 쌍 생성"):
-        positive_pairs.extend(itertools.combinations(imgs, 2))
+    num_positive_pairs = sum(len(imgs) * (len(imgs) - 1) // 2 for imgs in identity_map.values())
+    num_negative_pairs = num_positive_pairs  
 
-    num_positive_pairs = len(positive_pairs)
-
-    num_cpus = os.cpu_count() if os.cpu_count() is not None else 8
-    negative_pairs = generate_negative_pairs_parallel(identity_map, num_positive_pairs, num_cpus)
-
-    logging.info(f"- 동일 인물 쌍: {len(positive_pairs)}개, 다른 인물 쌍: {len(negative_pairs)}개")
+    logging.info(f"- 동일 인물 쌍 (Generator 생성..): {num_positive_pairs}개, 다른 인물 쌍 (Generator 생성..): {num_negative_pairs}개")
 
 
     if args.load_cache is not None :
         cache_path = args.load_cache
-        loaded_npz = np.load(cache_path)
-        embeddings = {key: loaded_npz[key] for key in tqdm(loaded_npz.files , desc='임베딩 캐시 로딩..')}
-        embeddings = loaded_npz
+        with np.load(cache_path) as loaded_npz:
+            embeddings = {key: torch.from_numpy(loaded_npz[key]) for key in tqdm(loaded_npz.files , desc='임베딩 캐시 로딩..')}
 
     else:
         embeddings = get_all_embeddings(
-            identity_map, backbone, args.device,args.batch_size
+            identity_map, backbone ,args.batch_size
         )
 
-    with Pool(initializer=init_worker, initargs=(embeddings,)) as pool:
-        # 1. 동일 인물 쌍 계산
-        pos_results = list(tqdm(pool.imap_unordered(_calculate_similarity_for_pair, positive_pairs , chunksize= 1000), 
-                                total=len(positive_pairs), 
-                                desc="동일 인물 쌍 계산"))
-        pos_similarities = [r for r in pos_results if r is not None]
-        pos_labels = [1] * len(pos_similarities)
 
-        # 2. 다른 인물 쌍 계산
-        neg_results = list(tqdm(pool.imap_unordered(_calculate_similarity_for_pair, negative_pairs , chunksize = 1000), 
-                                total=len(negative_pairs), 
-                                desc="다른 인물 쌍 계산"))
-        neg_similarities = [r for r in neg_results if r is not None]
-        neg_labels = [0] * len(neg_similarities)
+    positive_pairs_generator = generate_positive_pairs(identity_map)
+    negative_pairs_generator = generate_negative_pairs(identity_map, num_negative_pairs)
 
-    print(f"🔍 디버깅 정보:")
-    print(f"   - 전체 임베딩 수: {len(embeddings)}")
-    print(f"   - 유효한 임베딩 수: {sum(1 for v in embeddings.values() if v is not None)}")
-    print(f"   - None 임베딩 수: {sum(1 for v in embeddings.values() if v is None)}")
-    print(f"   - 양성 쌍 유사도 수 (변환 전): {len(pos_similarities)}")
-    print(f"   - 음성 쌍 유사도 수 (변환 전): {len(neg_similarities)}")
-    
-    pos_similarities_array = np.array(pos_similarities)
-    neg_similarities_array = np.array(neg_similarities)
-    
-    print(f"   - NaN 개수 (양성/음성): {np.isnan(pos_similarities_array).sum()} / {np.isnan(neg_similarities_array).sum()}")
-    print(f"   - Inf 개수 (양성/음성): {np.isinf(pos_similarities_array).sum()} / {np.isinf(neg_similarities_array).sum()}")
+    del backbone
+    gc.collect()
+    torch.cuda.empty_cache()
 
-    pos_similarities = pos_similarities_array
-    neg_similarities = neg_similarities_array
-    pos_labels = np.array(pos_labels)
-    neg_labels = np.array(neg_labels)
+    import time
+    start_time = time.time()
+
+
+    # ray 공유메모리 임베딩값 적재
+    embeddings_ref = ray.put(embeddings)
+
+
+    with open(os.path.join(script_dir, 'positive_for_pair.npy'), 'wb') as f:
+        neg_results_gen = ray_imap_unordered(_calculate_similarity_for_pair_images, negative_pairs_generator, embeddings_ref)
+        for result in tqdm(neg_results_gen, total=num_negative_pairs, desc="다른 인물 쌍 계산 및 저장 (Ray)"):
+            if result is not None:
+                result.tofile(f)
+
+    with open(os.path.join(script_dir, 'negative_for_pair.npy'), 'wb') as f:
+        neg_results_gen = ray_imap_unordered(_calculate_similarity_for_pair_images, negative_pairs_generator, embeddings_ref)
+        for result in tqdm(neg_results_gen, total=num_negative_pairs, desc="다른 인물 쌍 계산 및 저장 (Ray)"):
+            if result is not None:
+                result.tofile(f)
+
+
+    end_time = time.time() - start_time
+    logging.info(f"유사도 계산 및 파일 작성 완료. 소요시간: {end_time:.5f}초")
+
+    rank_1_accuracy, rank_5_accuracy, cmc_curve, max_rank, total_probes = calculate_identification_metrics(identity_map, embeddings)
+
+    if rank_1_accuracy is not None:
+            print(f"\n--- 얼굴 식별 성능 ---")
+            print(f"Rank-1 Accuracy: {rank_1_accuracy:.4f}")
+            print(f"Rank-5 Accuracy: {rank_5_accuracy:.4f}")
+            print(f"총 프로브 이미지 수: {total_probes}")
+
+            with open(LOG_FILE, 'a') as log_file:
+                log_file.write(f"\n얼굴 식별 성능:\n")
+                log_file.write(f"Rank-1 Accuracy: {rank_1_accuracy:.4f}\n")
+                log_file.write(f"Rank-5 Accuracy: {rank_5_accuracy:.4f}\n")
+                log_file.write(f"총 프로브 이미지 수: {total_probes}\n")
+                if cmc_curve is not None:
+                    log_file.write(f"CMC Curve (first 5 ranks): {cmc_curve[:5].tolist()}\n")
+                log_file.write("\n")
+
+            if cmc_curve is not None and max_rank > 0:
+                plt.figure(figsize=(8, 6))
+                plt.plot(np.arange(1, max_rank + 1), cmc_curve, marker='o', linestyle='-', markersize=4)
+                plt.xlim([1, min(max_rank, 20)]) # Show up to rank 20 or max_rank
+                plt.ylim([0.0, 1.05])
+                plt.xlabel('Rank (k)')
+                plt.ylabel('Accuracy')
+                plt.title(f'CMC Curve for {args.model}')
+                plt.grid(True)
+                cmc_plot_filename = f"_{args.model}_cmc_curve.png"
+                plt.savefig(cmc_plot_filename)
+                print(f"CMC 커브 그래프가 '{cmc_plot_filename}' 파일로 저장되었습니다.")
+    else:
+        print("\n--- 얼굴 식별 성능 ---")
+        print("얼굴 식별 성능을 계산할 수 없습니다 (유효한 프로브 이미지 부족).")
+
+    num_total_embeddings = len(embeddings)
+    num_valid_embeddings = sum(1 for v in embeddings.values() if v is not None)
+    num_none_embeddings = sum(1 for v in embeddings.values() if v is None)
+    total_dataset_img_len = sum(len(v) for v in identity_map.values())
+    total_class = len(identity_map)
+
+    del embeddings
+    del identity_map
+    gc.collect()
+
+    start_time = time.time()
+    logging.info("파일에서 유사도 데이터를 로딩합니다 ...")
+    try:
+        pos_similarities = np.fromfile('positive_for_pair.npy', dtype=np.float16)
+        logging.info(f"동일 인물 유사도 로딩 완료: {len(pos_similarities)}개")
+
+        neg_similarities = np.fromfile('negative_for_pair.npy', dtype=np.float16)
+        logging.info(f"다른 인물 유사도 로딩 완료: {len(neg_similarities)}개")
+
+    except FileNotFoundError as e:
+        logging.error(f"오류: {e}.")
+        exit(1)
+
+    end_time = time.time() - start_time
+    logging.info(f"파일 로드 소요시간: {end_time:.5f}초")
+
+    pos_labels = np.ones(len(pos_similarities))
+    neg_labels = np.zeros(len(neg_similarities))
 
     pos_finite_mask = np.isfinite(pos_similarities)
     neg_finite_mask = np.isfinite(neg_similarities)
@@ -491,15 +580,6 @@ def main(args):
     pos_labels = pos_labels[pos_finite_mask]
     neg_labels = neg_labels[neg_finite_mask]
 
-
-    with open(LOG_FILE, 'a') as log_file:
-        log_file.write(f"현재시각 : {datetime.now().strftime('%Y.%m.%d - %H:%M:%S')}\n")
-        log_file.write(f"\n🔍 디버깅 정보:\n")
-        log_file.write(f"   - 전체 임베딩 수: {len(embeddings)}\n")
-        log_file.write(f"   - 유효한 임베딩 수: {sum(1 for v in embeddings.values() if v is not None)}\n")
-        log_file.write(f"   - None 임베딩 수: {sum(1 for v in embeddings.values() if v is None)}\n")
-        log_file.write(f"   - 양성 쌍 유사도 수 (필터링 후): {len(pos_similarities)}\n")
-        log_file.write(f"   - 음성 쌍 유사도 수 (필터링 후): {len(neg_similarities)}\n")
 
     print(f"\n--- 유사도 분포 분석 ---")
     if len(pos_similarities) > 0 and len(neg_similarities) > 0:
@@ -527,26 +607,54 @@ def main(args):
         print(f"   - 표준편차: {neg_std:.4f}" if isinstance(neg_std, (int, float)) else f"   - 표준편차: {neg_std}")
 
 
+
         with open(LOG_FILE, 'a') as log_file:
-            log_file.write(f"\n--- 유사도 분포 분석 ---")
-            log_file.write(f"\n🔵 동일 인물 쌍 유사도 (총 {len(pos_similarities):,}개):\n")
-            log_file.write(f"   - 최소값: {np.min(pos_similarities):.4f}\n")
-            log_file.write(f"   - 최대값: {np.max(pos_similarities):.4f}\n")
-            log_file.write(f"   - 평균값: {np.mean(pos_similarities.astype(np.float64)):.4f}\n")
-            log_file.write(f"   - 표준편차: {pos_std:.4f}\n" if isinstance(pos_std, (int, float)) else f"   - 표준편차: {pos_std}\n")
+            log_file.write(f"\n--- 유사도 분포 분석 ---\n")  
+            log_file.write(f"🔍 디버깅 정보:\n")          
+            log_file.write(f"   - 전체 임베딩 수: {num_total_embeddings}\n")
+            log_file.write(f"   - 유효한 임베딩 수: {num_valid_embeddings}\n")
+            log_file.write(f"   - None 임베딩 수: {num_none_embeddings}\n")
+            log_file.write(f"\n") 
+
+            log_file.write(f"🔵 동일 인물 쌍 유사도 (총 {len(pos_similarities):,}개):\n")
+            log_file.write(f"   - 최소값: {np.min(pos_similarities):.4f}\n")     
+            log_file.write(f"   - 최대값: {np.max(pos_similarities):.4f}\n")        
+            log_file.write(f"   - 평균값: {np.mean(pos_similarities.astype(np.float64)):.4f}\n") 
             
-            log_file.write(f"🔴 다른 인물 쌍 유사도 (총 {len(neg_similarities):,}개):\n")
-            log_file.write(f"   - 최소값: {np.min(neg_similarities):.4f}\n")
-            log_file.write(f"   - 최대값: {np.max(neg_similarities):.4f}\n")
-            log_file.write(f"   - 평균값: {np.mean(neg_similarities.astype(np.float64)):.4f}\n")
-            log_file.write(f"   - 표준편차: {neg_std:.4f}\n" if isinstance(neg_std, (int, float)) else f"   - 표준편차: {neg_std}\n")
+            if isinstance(pos_std, (int, float)):
+                log_file.write(f"   - 표준편차: {pos_std:.4f}\n")
+            else:
+                log_file.write(f"   - 표준편차: {pos_std}\n")
+            
+            log_file.write(f"\n")
+            log_file.write(f"🔴 다른 인물 쌍 유사도 (총 {len(neg_similarities):,}개):\n") 
+            log_file.write(f"   - 최소값: {np.min(neg_similarities):.4f}\n")        
+            log_file.write(f"   - 최대값: {np.max(neg_similarities):.4f}\n")         
+            log_file.write(f"   - 평균값: {np.mean(neg_similarities.astype(np.float64)):.4f}\n") 
+
+            if isinstance(neg_std, (int, float)):
+                log_file.write(f"   - 표준편차: {neg_std:.4f}\n")
+            else:
+                log_file.write(f"   - 표준편차: {neg_std}\n")
+            
+            log_file.write('\n')
+
     else:
         logging.info("유사도 데이터가 충분하지 않아 분포 분석을 수행할 수 없습니다.")
         logging.info(f"len pos : {len(pos_similarities)}, len neg: {len(neg_similarities)}")
         exit(0)
+
+    with open(LOG_FILE, 'a') as log_file:
+        log_file.write(f"   - 양성 쌍 유사도 수 (필터링 후): {len(pos_similarities)}\n")
+        log_file.write(f"   - 음성 쌍 유사도 수 (필터링 후): {len(neg_similarities)}\n")
     
+
+
     scores = np.concatenate([pos_similarities, neg_similarities])
     labels = np.concatenate([pos_labels, neg_labels])
+
+    del pos_similarities , neg_similarities , pos_labels , neg_labels
+    gc.collect()
 
     logging.info("\n--- 최종 평가 결과 ---")
     if labels.size > 0:
@@ -579,60 +687,31 @@ def main(args):
         
         with open(LOG_FILE, 'a') as log_file:
             log_file.write(f"\n평가 결과:\n")
+            log_file.write(f"전체 클래스수  : {NUM_FOLDER_TO_PROCESS}  전체 사람 이미지수 : {TOTAL_IMAGE_LEN}\n")
             log_file.write(f"ROC-AUC: {roc_auc:.4f}, EER: {eer:.4f} (Threshold: {eer_threshold:.4f})\n")
             log_file.write(f"Accuracy: {metrics['accuracy']:.4f}, Recall: {metrics['recall']:.4f}, F1-Score: {metrics['f1_score']:.4f}\n")
             for far, tar in tar_at_far_results.items():
                 log_file.write(f"TAR @ FAR {far*100:g}%: {tar:.4f}\n")
-            log_file.write("\n")  # 빈 줄 추가
+            log_file.write("\n")  
+            log_file.write(f"평가를 완료하였습니다 (종료시간) ---> {datetime.now().strftime('%Y.%m.%d - %H:%M:%S')}")
+            log_file.write("\n")
 
         excel_path = os.path.join(script_dir, args.excel_path)
-        total_dataset_img_len = sum(len(v) for v in identity_map.values())
-        total_class = len(identity_map)
-        
-        # Calculate identification metrics
-        rank_1_accuracy, rank_5_accuracy, cmc_curve, max_rank, total_probes = calculate_identification_metrics(identity_map, embeddings)
 
-        if rank_1_accuracy is not None:
-            print(f"\n--- 얼굴 식별 성능 ---")
-            print(f"Rank-1 Accuracy: {rank_1_accuracy:.4f}")
-            print(f"Rank-5 Accuracy: {rank_5_accuracy:.4f}")
-            print(f"총 프로브 이미지 수: {total_probes}")
+        try:
+            plot_roc_curve(fpr, tpr, roc_auc, args.model, excel_path)
+        except Exception as e:
+            logging.info(f"ROC Curve 이미지 저장 실패 {e}")
 
-            with open(LOG_FILE, 'a') as log_file:
-                log_file.write(f"\n얼굴 식별 성능:\n")
-                log_file.write(f"Rank-1 Accuracy: {rank_1_accuracy:.4f}\n")
-                log_file.write(f"Rank-5 Accuracy: {rank_5_accuracy:.4f}\n")
-                log_file.write(f"총 프로브 이미지 수: {total_probes}\n")
-                if cmc_curve is not None:
-                    log_file.write(f"CMC Curve (first 10 ranks): {cmc_curve[:10].tolist()}\n")
-                log_file.write("\n")
-
-            # Plot CMC Curve
-            if cmc_curve is not None and max_rank > 0:
-                plt.figure(figsize=(8, 6))
-                plt.plot(np.arange(1, max_rank + 1), cmc_curve, marker='o', linestyle='-', markersize=4)
-                plt.xlim([1, min(max_rank, 20)]) # Show up to rank 20 or max_rank
-                plt.ylim([0.0, 1.05])
-                plt.xlabel('Rank (k)')
-                plt.ylabel('Accuracy')
-                plt.title(f'CMC Curve for {args.model}')
-                plt.grid(True)
-                cmc_plot_filename = os.path.splitext(excel_path)[0] + f"_{args.model}_cmc_curve.png"
-                plt.savefig(cmc_plot_filename)
-                print(f"CMC 커브 그래프가 '{cmc_plot_filename}' 파일로 저장되었습니다.")
-        else:
-            print("\n--- 얼굴 식별 성능 ---")
-            print("얼굴 식별 성능을 계산할 수 없습니다 (유효한 프로브 이미지 부족).")
-            with open("LOG_FILE", 'a') as log_file:
-                log_file.write("\n얼굴 식별 성능:\n")
-                log_file.write("얼굴 식별 성능을 계산할 수 없습니다 (유효한 프로브 이미지 부족).\n")
-                log_file.write("\n")
-
-        save_results_to_excel(excel_path, args.model, roc_auc, eer, tar_at_far_results, 
-                              args.target_fars, metrics, total_dataset_img_len, total_class, args.data_path, args.model,
+        try:
+            save_results_to_excel(excel_path, args.model, roc_auc, eer, tar_at_far_results, \
+                              args.target_fars, metrics, total_dataset_img_len, total_class, args.data_path, args.model, \
                               rank_1_accuracy, rank_5_accuracy)
+        except Exception as e:
+            logging.info(f"EXCEL SAVE 저장 실패 {e}")
 
-        plot_roc_curve(fpr, tpr, roc_auc, args.model, excel_path)
+        logging.info(f"평가를 완료하였습니다 (종료시간) ---> {datetime.now().strftime('%Y.%m.%d - %H:%M:%S')}")
+
     else:
         msg = "평가를 위한 유효한 점수를 수집하지 못했습니다."
         print(msg)
@@ -640,7 +719,8 @@ def main(args):
 
 def save_results_to_excel(excel_path, model_name, roc_auc, eer, tar_at_far_results, target_fars, metrics, total_dataset_img_len, total_class,
                            data_path, model_attr_value, rank_1_accuracy=None, rank_5_accuracy=None):
-    """결과를 Excel 파일에 저장합니다."""
+
+
     new_data = {
         "model_name": [model_name],
         "roc_auc": [f"{roc_auc:.4f}"], "eer": [f"{eer:.4f}"],
@@ -694,7 +774,7 @@ def plot_roc_curve(fpr, tpr, roc_auc, model_name, excel_path):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="SEvaluation Script")
-    parser.add_argument('--model',type=str , default='Glint360K_R200_TopoFR', choices=['Glint360K_R50_TopoFR_9727', 'Glint360K_R200_TopoFR', 'MS1MV2_R200_TopoFR', 'Glint360K_R100_TopoFR_9760'],)
+    parser.add_argument('--model',type=str , default='Glint360K_R200_TopoFR', choices=['Glint360K_R200_TopoFR' , 'Glint360K_R50_TopoFR_9727', 'MS1MV2_R200_TopoFR', 'Glint360K_R100_TopoFR_9760'],)
     parser.add_argument("--data_path", type=str, default="/home/ubuntu/KOR_DATA/일반/kor_data_sorting", help="평가할 데이터셋의 루트 폴더")
     parser.add_argument("--excel_path", type=str, default="evaluation_results.xlsx", help="결과를 저장할 Excel 파일 이름")
     parser.add_argument("--target_fars", nargs='+', type=float, default=[0.01, 0.001, 0.0001], help="TAR을 계산할 FAR 목표값들")
@@ -702,6 +782,7 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=512, help="임베딩 추출 시 배치 크기")
     parser.add_argument('--load_cache' , type=str , default = None ,help="임베딩 캐시경로")
     parser.add_argument('--save_cache' , action='store_true')
+    parser.add_argument('--split',default=1 , help='전체클래스수 / N ')
     args = parser.parse_args()
 
     #args.data_path = '/home/ubuntu/KOR_DATA/kor_data_full_Middle_Resolution_aligend'

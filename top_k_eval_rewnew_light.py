@@ -18,6 +18,11 @@ from multiprocessing.pool import Pool
 from datetime import datetime
 from torch.utils.data import Dataset , DataLoader
 import gc
+import sys
+print(sys.version)
+import lightning as L
+from lightning.fabric import Fabric
+
 
 try:
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -25,6 +30,41 @@ except NameError:
     script_dir = os.getcwd()
 
 print(f"script dir ---> {script_dir}")
+
+class EmbeddingExtractor(L.LightningModule):
+    def __init__(self, backbone ):
+        super().__init__()
+        self.backbone = backbone
+
+    def forward(self, x):
+        return self.backbone(x)
+    
+    def predict_step(self , batch):
+        batch_tensor , bath_path = batch
+
+        output = self.backbone(batch_tensor)
+        vectors = output[1] if isinstance(output, tuple) else output    
+        return{'paths' : bath_path , 'embeddings' : vectors}
+    
+
+class DataModule(L.LightningDataModule):
+    def __init__(self , identity_map , batch_size ):
+        super().__init__()
+        self.identity_map = identity_map
+        self.batch_size = batch_size
+
+    def setup(self  , stage):
+        if stage == 'fit' or stage == 'predict':
+            self.dataset = Dataset_load(self.identity_map)
+
+    def predict_dataloader(self):
+        return DataLoader(
+            self.dataset ,
+            batch_size = self.batch_size,
+            shuffle= False,
+            num_workers= os.cpu_count(),
+            pin_memory= True
+        )
 
 class Dataset_load(Dataset):
     def __init__(self, identity_map):
@@ -56,7 +96,7 @@ def find_max_batch_size(model, input_shape, device):
     model.to(device)
     model.eval()
 
-    batch_size = 512
+    batch_size = 32
     max_batch_size = 0
 
     while True:
@@ -454,17 +494,31 @@ def main(args):
     num_negative_pairs = num_positive_pairs  
 
     logging.info(f"- 동일 인물 쌍 (Generator 생성..): {num_positive_pairs}개, 다른 인물 쌍 (Generator 생성..): {num_negative_pairs}개")
+    
+    backbone = EmbeddingExtractor(backbone=backbone)
+    datamodule  = DataModule(identity_map , batch_size=MAX_BATCH_SIZE // 2)
+    predict = L.Trainer(
+    accelerator="gpu", 
+    devices=2,
+    strategy="ddp",
+)
 
+    results = predict.predict(model=backbone , datamodule=datamodule)
+    embeddings = {}
 
-    if args.load_cache is not None :
-        cache_path = args.load_cache
-        with np.load(cache_path) as loaded_npz:
-            embeddings = {key: torch.from_numpy(loaded_npz[key]) for key in tqdm(loaded_npz.files , desc='임베딩 캐시 로딩..')}
+    for batch_result in results:
+        for path , embedding in zip(batch_result['paths'] , batch_result['embeddings']):
+            embeddings[path] = embedding.to(torch.float16).flatten()
 
-    else:
-        embeddings = get_all_embeddings(
-            identity_map, backbone ,args.batch_size
-        )
+    # if args.load_cache is not None : 
+    #     cache_path = args.load_cache
+    #     with np.load(cache_path) as loaded_npz:
+    #         embeddings = {key: torch.from_numpy(loaded_npz[key]) for key in tqdm(loaded_npz.files , desc='임베딩 캐시 로딩..')}
+
+    # else:
+    #     embeddings = get_all_embeddings(
+    #         identity_map, backbone ,args.batch_size
+    #     )
 
     # positive_embs_generator = generate_positive_pairs_embs(identity_map, embeddings)
     # negative_embs_generator = generate_negative_pairs_embs(identity_map, embeddings, num_negative_pairs)
@@ -607,7 +661,7 @@ def main(args):
 
 
         with open(LOG_FILE, 'a') as log_file:
-            log_file.write(f"\n--- 유사도 분포 분석 ---\n")  
+            log_file.write(f"\n--- 유사도 분포 분석 ---\\n")  
             log_file.write(f"🔍 디버깅 정보:\n")          
             log_file.write(f"   - 전체 임베딩 수: {num_total_embeddings}\n")
             log_file.write(f"   - 유효한 임베딩 수: {num_valid_embeddings}\n")
@@ -772,11 +826,11 @@ def plot_roc_curve(fpr, tpr, roc_auc, model_name, excel_path):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="SEvaluation Script")
-    parser.add_argument('--model',type=str , default='Glint360K_R200_TopoFR', choices=['Glint360K_R200_TopoFR' , 'Glint360K_R50_TopoFR_9727', 'MS1MV2_R200_TopoFR', 'Glint360K_R100_TopoFR_9760'],)
+    parser.add_argument('--model',type=str , default='Glint360K_R50_TopoFR_9727', choices=['Glint360K_R200_TopoFR' , 'Glint360K_R50_TopoFR_9727', 'MS1MV2_R200_TopoFR', 'Glint360K_R100_TopoFR_9760'],)
     parser.add_argument("--data_path", type=str, default="/home/ubuntu/KOR_DATA/일반/kor_data_sorting", help="평가할 데이터셋의 루트 폴더")
     parser.add_argument("--excel_path", type=str, default="evaluation_results.xlsx", help="결과를 저장할 Excel 파일 이름")
     parser.add_argument("--target_fars", nargs='+', type=float, default=[0.01, 0.001, 0.0001], help="TAR을 계산할 FAR 목표값들")
-    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="사용할 장치 (예: cpu, cuda, cuda:0)")
+    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="사용할 장치 (예: cpu, cuda, cuda:0")
     parser.add_argument("--batch_size", type=int, default=512, help="임베딩 추출 시 배치 크기")
     parser.add_argument('--load_cache' , type=str , default = None ,help="임베딩 캐시경로")
     parser.add_argument('--save_cache' , action='store_true')
