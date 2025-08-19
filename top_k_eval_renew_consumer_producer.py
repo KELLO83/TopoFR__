@@ -357,13 +357,14 @@ def producer_task(queue, identity_map, chunk_size , producer_id , num_producers 
     if chunk:
         queue.put(chunk)
 
-def writer_task(results_queue, output_file_path):
-    with open(output_file_path, 'wb') as f:
+def writer_task(results_queue, output_file_path, total_pairs, description):
+    with open(output_file_path, 'wb') as f, tqdm(total=total_pairs, desc=description, unit='pair') as pbar:
         while True:
             result = results_queue.get()
             if result is None:
                 break
             result.tofile(f)
+            pbar.update(1)
 
 def consumer_task(work_queue, results_queue, embeddings):
     while True:
@@ -394,26 +395,24 @@ def process_similarities_with_multiproducer(identity_map, embeddings, num_positi
     pos_file_path = os.path.join(script_dir, 'similarity_for_pair.npy')
     neg_file_path = os.path.join(script_dir, 'negative_for_pair.npy')
 
+    print("동일 인물 쌍 처리를 시작합니다.")
     producer_process = []
     consumer_process = []
-    data_queue = Queue() # 공유 큐 설정
+    data_queue = Queue()
     result_queue = Queue()
 
     for producer_id in range(num_producers):
         p = Process(target=producer_task , args=(data_queue , identity_map , chunk_size , producer_id , num_producers))
         producer_process.append(p)
-        p.start()
+        p.start() 
     
-
     for _ in range(num_consumers):
         c = Process(target=consumer_task , args=(data_queue , result_queue , embeddings))
         consumer_process.append(c)
         c.start()
 
-
-    w = Process(target=writer_task , args=(result_queue , pos_file_path))
-    w.start()
-
+    writer_pos = Process(target=writer_task, args=(result_queue, pos_file_path, num_positive_pairs, "동일 인물 쌍 처리"))
+    writer_pos.start()
 
     for p in producer_process:
         p.join()
@@ -425,27 +424,37 @@ def process_similarities_with_multiproducer(identity_map, embeddings, num_positi
         c.join()
 
     result_queue.put(None)
-    w.join()
+    writer_pos.join()
+    print("동일 인물 쌍 처리 완료.")
 
+    # --- 2. 다른 인물 쌍 처리 ---
+    print("다른 인물 쌍 처리를 시작합니다.")
+
+    producer_process = []
+    consumer_process = []
     data_queue = Queue()
     result_queue = Queue()
 
+    total_neg_pairs = num_negative_pairs
+    neg_pairs_per_producer = total_neg_pairs // num_producers
     
     for producer_id in range(num_producers):
-        p = Process(target=producer_task_negative , args=(data_queue , identity_map , chunk_size , num_negative_pairs))
+        num_to_generate = neg_pairs_per_producer
+        if producer_id == num_producers - 1:
+
+            num_to_generate = total_neg_pairs - (neg_pairs_per_producer * (num_producers - 1))
+
+        p = Process(target=producer_task_negative , args=(data_queue , identity_map , chunk_size , num_to_generate))
         producer_process.append(p)
         p.start()
     
-
     for _ in range(num_consumers):
         c = Process(target=consumer_task , args=(data_queue , result_queue , embeddings))
         consumer_process.append(c)
         c.start()
 
-
-    w = Process(target=writer_task , args=(result_queue , neg_file_path))
-    w.start()
-
+    writer_neg = Process(target=writer_task, args=(result_queue, neg_file_path, num_negative_pairs, "다른 인물 쌍 처리"))
+    writer_neg.start()
 
     for p in producer_process:
         p.join()
@@ -457,10 +466,8 @@ def process_similarities_with_multiproducer(identity_map, embeddings, num_positi
         c.join()
 
     result_queue.put(None)
-    w.join()
-
-
-
+    writer_neg.join()
+    print("다른 인물 쌍 처리 완료.")
 
 
 def main(args):
@@ -557,7 +564,7 @@ def main(args):
     logging.info(f"- 동일 인물 쌍 (Generator 생성..): {num_positive_pairs}개, 다른 인물 쌍 (Generator 생성..): {num_negative_pairs}개")
 
 
-    if args.load_cache is not None :
+    if args.load_cache is not None : 
         cache_path = args.load_cache
         with np.load(cache_path) as loaded_npz:
             embeddings = {key: torch.from_numpy(loaded_npz[key]) for key in tqdm(loaded_npz.files , desc='임베딩 캐시 로딩..')}
@@ -675,7 +682,7 @@ def main(args):
 
 
         with open(LOG_FILE, 'a') as log_file:
-            log_file.write(f"\n--- 유사도 분포 분석 ---\n")  
+            log_file.write(f"\n--- 유사도 분포 분석 ---")  
             log_file.write(f"🔍 디버깅 정보:\n")          
             log_file.write(f"   - 전체 임베딩 수: {num_total_embeddings}\n")
             log_file.write(f"   - 유효한 임베딩 수: {num_valid_embeddings}\n")
