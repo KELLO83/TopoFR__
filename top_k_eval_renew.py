@@ -18,7 +18,6 @@ from multiprocessing.pool import Pool
 from datetime import datetime
 from torch.utils.data import Dataset , DataLoader
 import gc
-import albumentations as A
 
 try:
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -31,9 +30,6 @@ class Dataset_load(Dataset):
     def __init__(self, identity_map):
         super().__init__()
         self.all_images = sorted(list(set(itertools.chain.from_iterable(identity_map.values()))))
-        self.albu_transform = A.Compose([
-                A.CLAHE(always_apply=True , clip_limit= 3, tile_grid_size=(8, 8)),
-            ])
         
         self.transform = v2.Compose([
             v2.ToImage(), 
