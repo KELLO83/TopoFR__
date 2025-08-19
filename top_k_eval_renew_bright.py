@@ -19,6 +19,7 @@ from datetime import datetime
 from torch.utils.data import Dataset , DataLoader
 import gc
 import albumentations as A
+from bright.model import enhance_net_nopool
 
 try:
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -31,9 +32,9 @@ class Dataset_load(Dataset):
     def __init__(self, identity_map):
         super().__init__()
         self.all_images = sorted(list(set(itertools.chain.from_iterable(identity_map.values()))))
-        self.albu_transform = A.Compose([
-                A.CLAHE(always_apply=True , clip_limit= 3, tile_grid_size=(8, 8)),
-            ])
+        # self.albu_transform = A.Compose([
+        #         A.CLAHE(always_apply=True , clip_limit= 3, tile_grid_size=(8, 8)),
+        #     ])
         
         self.transform = v2.Compose([
             v2.ToImage(), 
@@ -42,6 +43,9 @@ class Dataset_load(Dataset):
             v2.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
         ])
 
+        self.DCE_NET  = enhance_net_nopool(12).cuda()
+        self.DCE_NET.load_state_dict(torch.load('Epoch99.pth'))
+
     def __len__(self):
         return len(self.all_images)
     
@@ -49,7 +53,31 @@ class Dataset_load(Dataset):
         image_path = self.all_images[index]
         image = cv2.imread(image_path) # BGR순서로 읽음..
         image = cv2.cvtColor(image , cv2.COLOR_BGR2RGB)
-        image = self.albu_transform(image=image)['image']
+
+        image_hsv = cv2.cvtColor(image , cv2.COLOR_RGB2HSV)
+        v_channel = image_hsv[:, :, 2]
+        mean_brightness = np.mean(v_channel)
+
+        if mean_brightness < 35:
+            scale_factor = 12
+
+            data_lowlight = image.astype(np.float32) / 255.0
+
+            data_lowlight = torch.from_numpy(data_lowlight).float()
+
+            h=(data_lowlight.shape[0]//scale_factor)*scale_factor
+            w=(data_lowlight.shape[1]//scale_factor)*scale_factor
+            data_lowlight = data_lowlight[0:h,0:w,:]
+            data_lowlight = data_lowlight.permute(2,0,1)
+            data_lowlight = data_lowlight.cuda().unsqueeze(0)
+            enhanced_image, _  = self.DCE_NET(data_lowlight)
+
+            enhanced_image = enhanced_image.squeeze(0).permute(1,2,0).cpu().detach().numpy()
+            enhanced_image = (enhanced_image * 255).astype(np.uint8)
+            image = enhanced_image
+
+        # image = self.albu_transform(image=image)['image']
+
         image_tensor = self.transform(image)
         return image_tensor, image_path
     
@@ -159,7 +187,7 @@ def get_all_embeddings(identity_map, backbone, batch_size):
         dataset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=os.cpu_count(),
+        num_workers=0,
         pin_memory=True, 
     )
 
@@ -789,7 +817,7 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=512, help="임베딩 추출 시 배치 크기")
     parser.add_argument('--load_cache' , type=str , default = None ,help="임베딩 캐시경로")
     parser.add_argument('--save_cache' , action='store_true')
-    parser.add_argument('--split',default=1 , help='전체클래스수 / N ')
+    parser.add_argument('--split',default=4 , help='전체클래스수 / N ')
     args = parser.parse_args()
 
     #args.data_path = '/home/ubuntu/KOR_DATA/kor_data_full_Middle_Resolution_aligend'
