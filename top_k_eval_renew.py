@@ -18,6 +18,7 @@ from multiprocessing.pool import Pool
 from datetime import datetime
 from torch.utils.data import Dataset , DataLoader
 import gc
+import albumentations as A
 
 try:
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -30,7 +31,10 @@ class Dataset_load(Dataset):
     def __init__(self, identity_map):
         super().__init__()
         self.all_images = sorted(list(set(itertools.chain.from_iterable(identity_map.values()))))
-
+        self.albu_transform = A.Compose([
+                A.CLAHE(always_apply=True , clip_limit= 3, tile_grid_size=(8, 8)),
+            ])
+        
         self.transform = v2.Compose([
             v2.ToImage(), 
             v2.ToDtype(torch.float32, scale=True),
@@ -45,6 +49,7 @@ class Dataset_load(Dataset):
         image_path = self.all_images[index]
         image = cv2.imread(image_path) # BGR순서로 읽음..
         image = cv2.cvtColor(image , cv2.COLOR_BGR2RGB)
+        image = self.albu_transform(image=image)['image']
         image_tensor = self.transform(image)
         return image_tensor, image_path
     
@@ -207,21 +212,6 @@ def _calculate_similarity_for_pair_images(pair):
             
     return None
 
-def _calculate_similarity_for_pair_embs(embs_pair):
-    emb1, emb2 = embs_pair
-    
-    if emb1 is not None and emb2 is not None:
-        emb1 = emb1.to(torch.float32)
-        emb2 = emb2.to(torch.float32)
-
-        norm1 = torch.norm(emb1)
-        norm2 = torch.norm(emb2)
-
-        if norm1 > 0 and norm2 > 0:
-            cosine_similarity = torch.dot(emb1, emb2) / (norm1 * norm2)
-            return cosine_similarity.cpu().numpy().astype(np.float16)
-            
-    return None
 
 def calculate_identification_metrics(identity_map, embeddings):
     logging.info("Calculating identification metrics (Rank-k, CMC)...")
@@ -320,38 +310,12 @@ def calculate_identification_metrics(identity_map, embeddings):
 
     return rank_1_accuracy, rank_5_accuracy, cmc_curve, max_rank, total_probes
 
-def generate_positive_pairs_embs(identity_map, embeddings ):
-    for imgs in identity_map.values():
-        for path1, path2 in itertools.combinations(imgs, 2):
-            emb1 = embeddings.get(path1)
-            emb2 = embeddings.get(path2)
-            if emb1 is not None and emb2 is not None:
-                yield (emb1, emb2)
-
-def generate_negative_pairs_embs(identity_map , embeddings , num_pairs):
-    identities = list(identity_map.keys())
-    if len(identities) < 2:
-        return
-    
-    for _ in range(num_pairs):
-        id1, id2 = random.sample(identities, 2)
-        img1 = random.choice(identity_map[id1])
-        img2 = random.choice(identity_map[id2])
-
-        emb1 = embeddings.get(img1)
-        emb2 = embeddings.get(img2)
-        
-        if emb1 is not None and emb2 is not None:
-            yield (emb1 , emb2)
-
 def generate_positive_pairs(identity_map):
-    """동일 인물 쌍을 생성하는 제너레이터"""
     for imgs in identity_map.values():
         for pair in itertools.combinations(imgs, 2):
             yield pair
 
 def generate_negative_pairs(identity_map, num_pairs):
-    """다른 인물 쌍을 생성하는 제너레이터 (중복 허용)"""
     identities = list(identity_map.keys())
     if len(identities) < 2:
         return
@@ -466,9 +430,6 @@ def main(args):
             identity_map, backbone ,args.batch_size
         )
 
-    # positive_embs_generator = generate_positive_pairs_embs(identity_map, embeddings)
-    # negative_embs_generator = generate_negative_pairs_embs(identity_map, embeddings, num_negative_pairs)
-
     positive_pairs_generator = generate_positive_pairs(identity_map)
     negative_pairs_generator = generate_negative_pairs(identity_map, num_negative_pairs)
 
@@ -478,19 +439,6 @@ def main(args):
 
     import time
     start_time = time.time()
-
-    # with Pool(processes=os.cpu_count()) as pool:
-    #     with open(os.path.join(script_dir, 'similarity_for_pair.npy') , 'wb') as f:
-    #         pos_result_gen = pool.imap_unordered(_calculate_similarity_for_pair_embs , positive_embs_generator , chunksize=1000)
-    #         for result in tqdm(pos_result_gen , total=num_positive_pairs , desc= '동일 인물 쌍 계산 및 저장'):
-    #             if result is not None:
-    #                 result.tofile(f)
-
-    #     with open(os.path.join(script_dir , 'negative_for_pair.npy'), 'wb') as f:
-    #         neg_result_gen = pool.imap_unordered(_calculate_similarity_for_pair_embs , negative_embs_generator , chunksize= 1000)
-    #         for result in tqdm(neg_result_gen , total=num_negative_pairs , desc='다른 인물 쌍 계산 및 저장'):
-    #             if result is not None:
-    #                 result.tofile(f)
 
     with Pool(initializer=init_worker, initargs=(embeddings,)) as pool:
         with open(os.path.join(script_dir, 'similarity_for_pair.npy') , 'wb') as f:
@@ -656,22 +604,26 @@ def main(args):
 
     logging.info("\n--- 최종 평가 결과 ---")
     if labels.size > 0:
-        fpr, tpr, thresholds = roc_curve(labels, scores)
-        roc_auc = auc(fpr, tpr)
-        
-        frr = 1 - tpr
-        eer_index = np.nanargmin(np.abs(fpr - frr))
-        eer = fpr[eer_index]
-        eer_threshold = thresholds[eer_index]
 
-        tar_at_far_results = {far: np.interp(far, fpr, tpr) for far in args.target_fars}
+        fpr, tpr, thresholds = roc_curve(labels, scores) # 임계점의 변화에따른 본인수락률과 타인수락률의 변화율 
+        # 임계점을 극단적으로 높이면 본인수락률이 높아지지만 타인수락률 역시 높아지기때문에 본인수락률은 높으면서 타인수락률은 낮아지게 구분하는 임계점을 찾습니다
+
+        roc_auc = auc(fpr, tpr) 
         
-        predictions = (scores >= eer_threshold).astype(int)
-        cm = confusion_matrix(labels, predictions)
+        frr = 1 - tpr # 본인거부율 본인인데 본인이라고 인지못하고 거절
+        eer_index = np.nanargmin(np.abs(fpr - frr)) # 타인수락에러율 / 본인거절에러율이 같아질떄의 임계점 X의값
+        eer = fpr[eer_index] # 해당변수 eer(Equal Error Rate) 은 타인수락율과 / 본인거절에러율이 같을때를 정의합니다 Ex) eer이 3%일때 해당모델은 본인거절 또는 타인수락을 100명중에 3명꼴로 진행하며 해당모델의 에러율은 3%입니다
+        eer_threshold = thresholds[eer_index] # 타인수락률과 본인거절율이 같아지는 임계점 X를 정합니다 향후 임계점 X보다 크다면 동일인문 X보다 작다면 다른인물로 판별합니다
+
+        tar_at_far_results = {far: np.interp(far, fpr, tpr) for far in args.target_fars} # FAR(타인수락에러율)을 강제적으로 고정할때 본인수락확률이 얼마인지 알아냅니다 FAR을 0.01%고정(10,000명중 1명꼴로 타인을 본인이라고 잘못승인할때) 본인수락률은?
         
+        predictions = (scores >= eer_threshold).astype(int) # EER을 만족하는 임게점을 가지고 true , postive를 구성합니다
+        cm = confusion_matrix(labels, predictions) # 실제정답과 추측(true , positive)를 통하여 TP , TN , FP , FN 을 구성합니다 본인수락률 , 본인거절율 , 타인수락률 , 타인거절율
+
         tn, fp, fn, tp = cm.ravel() if cm.size == 4 else (0,0,0,0)
 
-        accuracy = (tp + tn) / (tp + tn + fp + fn) if (tp + tn + fp + fn) > 0 else 0
+        accuracy = (tp + tn) / (tp + tn + fp + fn) if (tp + tn + fp + fn) > 0 else 0 
+
         recall = tp / (tp + fn) if (tp + fn) > 0 else 0
         precision = tp / (tp + fp) if (tp + fp) > 0 else 0
         f1_score = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0

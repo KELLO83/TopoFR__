@@ -15,14 +15,10 @@ import torchvision.transforms.v2 as v2
 import numpy as np
 from backbones.iresnet import IResNet , IBasicBlock
 from multiprocessing.pool import Pool
-from multiprocessing import Process, Queue, Event
 from datetime import datetime
 from torch.utils.data import Dataset , DataLoader
 import gc
-import threading
-import queue
-import time
-import sys
+import albumentations as A
 
 try:
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -30,13 +26,15 @@ except NameError:
     script_dir = os.getcwd()
 
 print(f"script dir ---> {script_dir}")
-print(f"python version {sys.version}")
 
 class Dataset_load(Dataset):
     def __init__(self, identity_map):
         super().__init__()
         self.all_images = sorted(list(set(itertools.chain.from_iterable(identity_map.values()))))
-
+        self.albu_transform = A.Compose([
+                A.CLAHE(always_apply=True , clip_limit= 3, tile_grid_size=(8, 8)),
+            ])
+        
         self.transform = v2.Compose([
             v2.ToImage(), 
             v2.ToDtype(torch.float32, scale=True),
@@ -51,6 +49,7 @@ class Dataset_load(Dataset):
         image_path = self.all_images[index]
         image = cv2.imread(image_path) # BGR순서로 읽음..
         image = cv2.cvtColor(image , cv2.COLOR_BGR2RGB)
+        image = self.albu_transform(image=image)['image']
         image_tensor = self.transform(image)
         return image_tensor, image_path
     
@@ -193,6 +192,42 @@ def get_all_embeddings(identity_map, backbone, batch_size):
 
     return embeddings
 
+def _calculate_similarity_for_pair_images(pair):
+    global embeddings
+    img1_path, img2_path = pair
+    
+    emb1 = embeddings.get(img1_path)
+    emb2 = embeddings.get(img2_path)
+    
+    if emb1 is not None and emb2 is not None:
+        emb1 = emb1.to(torch.float32)
+        emb2 = emb2.to(torch.float32)
+
+        norm1 = torch.norm(emb1)
+        norm2 = torch.norm(emb2)
+
+        if norm1 > 0 and norm2 > 0:
+            cosine_similarity = torch.dot(emb1, emb2) / (norm1 * norm2)
+            return cosine_similarity.cpu().numpy().astype(np.float16)
+            
+    return None
+
+def _calculate_similarity_for_pair_embs(embs_pair):
+    emb1, emb2 = embs_pair
+    
+    if emb1 is not None and emb2 is not None:
+        emb1 = emb1.to(torch.float32)
+        emb2 = emb2.to(torch.float32)
+
+        norm1 = torch.norm(emb1)
+        norm2 = torch.norm(emb2)
+
+        if norm1 > 0 and norm2 > 0:
+            cosine_similarity = torch.dot(emb1, emb2) / (norm1 * norm2)
+            return cosine_similarity.cpu().numpy().astype(np.float16)
+            
+    return None
+
 def calculate_identification_metrics(identity_map, embeddings):
     logging.info("Calculating identification metrics (Rank-k, CMC)...")
 
@@ -290,12 +325,38 @@ def calculate_identification_metrics(identity_map, embeddings):
 
     return rank_1_accuracy, rank_5_accuracy, cmc_curve, max_rank, total_probes
 
+def generate_positive_pairs_embs(identity_map, embeddings ):
+    for imgs in identity_map.values():
+        for path1, path2 in itertools.combinations(imgs, 2):
+            emb1 = embeddings.get(path1)
+            emb2 = embeddings.get(path2)
+            if emb1 is not None and emb2 is not None:
+                yield (emb1, emb2)
+
+def generate_negative_pairs_embs(identity_map , embeddings , num_pairs):
+    identities = list(identity_map.keys())
+    if len(identities) < 2:
+        return
+    
+    for _ in range(num_pairs):
+        id1, id2 = random.sample(identities, 2)
+        img1 = random.choice(identity_map[id1])
+        img2 = random.choice(identity_map[id2])
+
+        emb1 = embeddings.get(img1)
+        emb2 = embeddings.get(img2)
+        
+        if emb1 is not None and emb2 is not None:
+            yield (emb1 , emb2)
+
 def generate_positive_pairs(identity_map):
+    """동일 인물 쌍을 생성하는 제너레이터"""
     for imgs in identity_map.values():
         for pair in itertools.combinations(imgs, 2):
             yield pair
 
 def generate_negative_pairs(identity_map, num_pairs):
+    """다른 인물 쌍을 생성하는 제너레이터 (중복 허용)"""
     identities = list(identity_map.keys())
     if len(identities) < 2:
         return
@@ -305,347 +366,6 @@ def generate_negative_pairs(identity_map, num_pairs):
         img1 = random.choice(identity_map[id1])
         img2 = random.choice(identity_map[id2])
         yield (img1, img2)
-
-def positive_pair_producer(identity_map, pair_queue, chunk_size, producer_id, total_producers, stop_event):
-    """동일 인물 쌍을 생성하는 생산자 프로세스"""
-    try:
-        identities = list(identity_map.keys())
-        # 각 생산자가 담당할 identity 범위 분할
-        per_producer = len(identities) // total_producers
-        start_idx = producer_id * per_producer
-        end_idx = (producer_id + 1) * per_producer if producer_id < total_producers - 1 else len(identities)
-        
-        assigned_identities = identities[start_idx:end_idx]
-        
-        # 할당된 identity들로 부분 identity_map 생성
-        assigned_identity_map = {identity: identity_map[identity] for identity in assigned_identities}
-        
-        # generate_positive_pairs 제너레이터 사용
-        positive_generator = generate_positive_pairs(assigned_identity_map)
-        
-        chunk = []
-        pair_count = 0
-        
-        for pair in positive_generator:
-            if stop_event.is_set():
-                break
-                
-            chunk.append(pair)
-            pair_count += 1
-            
-            if len(chunk) >= chunk_size:
-                pair_queue.put(('positive', chunk.copy()))
-                chunk.clear()
-        
-        # 마지막 chunk 처리
-        if chunk and not stop_event.is_set():
-            pair_queue.put(('positive', chunk))
-        
-        logging.info(f"Positive producer {producer_id} completed: {pair_count} pairs generated")
-        
-    except Exception as e:
-        logging.error(f"Error in positive producer {producer_id}: {e}")
-    finally:
-        # 생산자 종료 신호
-        try:
-            pair_queue.put(('done', producer_id), timeout=1)
-        except:
-            pass
-
-def negative_pair_producer(identity_map, pair_queue, chunk_size, producer_id, total_producers, total_negative_pairs, stop_event):
-    """다른 인물 쌍을 생성하는 생산자 프로세스"""
-    try:
-        # 각 생산자 프로세스가 독립적이고 재현 가능한 난수 시퀀스를 갖도록 시드를 설정합니다.
-        # producer_id를 더하여 각 생산자가 다른 시퀀스를 생성하도록 보장합니다.
-        random.seed(42 + producer_id)
-        np.random.seed(42 + producer_id)
-
-        identities = list(identity_map.keys())
-        if len(identities) < 2:
-            return
-        
-        # 각 생산자가 생성해야 할 negative pair 수
-        pairs_per_producer = total_negative_pairs // total_producers
-        if producer_id == total_producers - 1:  # 마지막 생산자가 나머지 처리
-            pairs_per_producer += total_negative_pairs % total_producers
-        
-        # generate_negative_pairs 제너레이터 사용
-        negative_generator = generate_negative_pairs(identity_map, pairs_per_producer)
-        
-        chunk = []
-        pair_count = 0
-        
-        for pair in negative_generator:
-            if stop_event.is_set():
-                break
-                
-            chunk.append(pair)
-            pair_count += 1
-            
-            if len(chunk) >= chunk_size:
-                pair_queue.put(('negative', chunk.copy()))
-                chunk.clear()
-        
-        # 마지막 chunk 처리
-        if chunk and not stop_event.is_set():
-            pair_queue.put(('negative', chunk))
-        
-        logging.info(f"Negative producer {producer_id} completed: {pair_count} pairs generated")
-        
-    except Exception as e:
-        logging.error(f"Error in negative producer {producer_id}: {e}")
-    finally:
-        # 생산자 종료 신호
-        try:
-            pair_queue.put(('done', producer_id), timeout=1)
-        except:
-            pass
-
-def similarity_consumer(pair_queue, pos_file_path, neg_file_path, embeddings, consumer_id, stop_event, progress_counter=None):
-    """유사도 계산 및 직접 파일 쓰기를 수행하는 소비자 프로세스"""
-    try:
-        processed_count = 0
-        pos_count = 0
-        neg_count = 0
-        
-        # 각 소비자가 독립적으로 파일에 append 모드로 쓰기
-        pos_file_lock_path = pos_file_path + f'.lock_{consumer_id}'
-        neg_file_lock_path = neg_file_path + f'.lock_{consumer_id}'
-        
-        with open(pos_file_lock_path, 'wb') as pos_temp_file, \
-             open(neg_file_lock_path, 'wb') as neg_temp_file:
-            
-            while not stop_event.is_set():
-                try:
-                    item = pair_queue.get(timeout=2)
-                    
-                    if item is None or item[0] == 'done':
-                        pair_queue.put(item)  # 다른 consumer를 위해 다시 큐에 넣기
-                        break
-                    
-                    pair_type, pairs = item
-                    
-                    for pair in pairs:
-                        img1_path, img2_path = pair
-                        
-                        emb1 = embeddings.get(img1_path)
-                        emb2 = embeddings.get(img2_path)
-                        
-                        if emb1 is not None and emb2 is not None:
-                            emb1 = emb1.to(torch.float32)
-                            emb2 = emb2.to(torch.float32)
-
-                            norm1 = torch.norm(emb1)
-                            norm2 = torch.norm(emb2)
-
-                            if norm1 > 0 and norm2 > 0:
-                                cosine_similarity = torch.dot(emb1, emb2) / (norm1 * norm2)
-                                similarity_value = cosine_similarity.cpu().numpy().astype(np.float16)
-                                
-                                # 즉시 파일에 쓰기
-                                if pair_type == 'positive':
-                                    similarity_value.tofile(pos_temp_file)
-                                    pos_count += 1
-                                elif pair_type == 'negative':
-                                    similarity_value.tofile(neg_temp_file)
-                                    neg_count += 1
-                                
-                                processed_count += 1
-                                
-                                # 진행률 업데이트
-                                if progress_counter is not None:
-                                    with progress_counter.get_lock():
-                                        progress_counter.value += 1
-                
-                except queue.Empty:
-                    continue
-                except Exception as e:
-                    logging.error(f"Error in consumer {consumer_id}: {e}")
-                    break
-        
-        logging.info(f"Consumer {consumer_id} completed: {processed_count} pairs processed, {pos_count} positive, {neg_count} negative")
-        return pos_file_lock_path, neg_file_lock_path, pos_count, neg_count
-        
-    except Exception as e:
-        logging.error(f"Fatal error in consumer {consumer_id}: {e}")
-        return None, None, 0, 0
-
-def merge_temp_files(temp_files, final_path, file_type):
-    """임시 파일들을 최종 파일로 병합"""
-    try:
-        total_count = 0
-        with open(final_path, 'wb') as final_file:
-            for temp_file_path in temp_files:
-                if os.path.exists(temp_file_path):
-                    with open(temp_file_path, 'rb') as temp_file:
-                        while True:
-                            chunk = temp_file.read(8192)  # 8KB 단위로 읽기
-                            if not chunk:
-                                break
-                            final_file.write(chunk)
-                            total_count += len(chunk) // 2  # float16 = 2 bytes
-                    
-                    # 임시 파일 삭제
-                    os.remove(temp_file_path)
-                    logging.info(f"임시 파일 삭제: {temp_file_path}")
-        
-        logging.info(f"{file_type} 파일 병합 완료: {final_path}, 총 {total_count}개 데이터")
-        return total_count
-        
-    except Exception as e:
-        logging.error(f"파일 병합 중 오류 ({file_type}): {e}")
-        return 0
-
-def process_similarities_with_multiproducer(identity_map, embeddings, num_positive_pairs, num_negative_pairs, script_dir):
-    from multiprocessing import Value
-    
-    # 설정
-    num_producers = max(2 , os.cpu_count() // 4) 
-    num_consumers = os.cpu_count() - num_producers
-    chunk_size = 10000
-
-    queue_size = max(1000, (num_positive_pairs + num_negative_pairs) // (chunk_size * 10))
-    
-    logging.info(f"다중 생산자-소비자 패턴 시작:")
-    logging.info(f"  - 생산자 프로세스: {num_producers}개")
-    logging.info(f"  - 소비자 프로세스: {num_consumers}개")
-    logging.info(f"  - 청크 크기: {chunk_size}")
-    logging.info(f"  - 큐 크기: {queue_size}")
-    
-    # 큐 및 이벤트 생성
-    pair_queue = Queue(maxsize=queue_size)
-    stop_event = Event()
-    
-    # 파일 경로
-    pos_file_path = os.path.join(script_dir, 'similarity_for_pair.npy')
-    neg_file_path = os.path.join(script_dir, 'negative_for_pair.npy')
-    
-    # 진행률 카운터 (공유 변수)
-    progress_counter = Value('i', 0)
-    total_expected = num_positive_pairs + num_negative_pairs
-    
-    try:
-        # 프로세스 리스트
-        processes = []
-        
-        # 생산자 프로세스 시작 (positive pairs)
-        for i in range(num_producers // 2):  # 절반은 positive
-            p = Process(target=positive_pair_producer, 
-                       args=(identity_map, pair_queue, chunk_size, i, num_producers // 2, stop_event))
-            p.start()
-            processes.append(p)
-        
-        # 생산자 프로세스 시작 (negative pairs)
-        for i in range(num_producers - num_producers // 2):  # 나머지는 negative
-            p = Process(target=negative_pair_producer, 
-                       args=(identity_map, pair_queue, chunk_size, i, num_producers - num_producers // 2, num_negative_pairs, stop_event))
-            p.start()
-            processes.append(p)
-        
-        # 소비자 프로세스 시작 (파일 쓰기 포함)
-        consumer_processes = []
-        for i in range(num_consumers):
-            p = Process(target=similarity_consumer, 
-                       args=(pair_queue, pos_file_path, neg_file_path, embeddings, i, stop_event, progress_counter))
-            p.start()
-            consumer_processes.append(p)
-            processes.append(p)
-        
-        # 진행률 모니터링을 위한 별도 스레드
-        def progress_monitor():
-            with tqdm(total=total_expected, desc="유사도 계산 및 저장") as pbar:
-                last_count = 0
-                while not stop_event.is_set():
-                    current_count = progress_counter.value
-                    if current_count > last_count:
-                        pbar.update(current_count - last_count)
-                        last_count = current_count
-                    time.sleep(0.1)
-                
-                # 최종 업데이트
-                final_count = progress_counter.value
-                if final_count > last_count:
-                    pbar.update(final_count - last_count)
-        
-        # 진행률 모니터 스레드 시작
-        monitor_thread = threading.Thread(target=progress_monitor, daemon=True)
-        monitor_thread.start()
-        
-        # 생산자들이 완료될 때까지 대기
-        start_time = time.time()
-        completed_producers = 0
-        total_producers = num_producers
-        
-        while completed_producers < total_producers:
-            try:
-                item = pair_queue.get(timeout=1)
-                if item[0] == 'done':
-                    completed_producers += 1
-                    logging.info(f"Producer {item[1]} completed ({completed_producers}/{total_producers})")
-                else:
-                    pair_queue.put(item)  # 다시 큐에 넣기
-            except queue.Empty:
-                continue
-        
-        logging.info("모든 생산자 완료. 소비자들이 작업 완료할 때까지 대기...")
-        
-        # 소비자들이 큐를 비울 시간 제공
-        time.sleep(2)
-        
-        # 모든 프로세스 종료
-        stop_event.set()
-        
-        # 큐에 종료 신호 넣기
-        for _ in range(num_consumers):
-            try:
-                pair_queue.put(None, timeout=1)
-            except queue.Full:
-                break
-        
-        # 소비자 프로세스들 종료 대기 및 임시 파일 수집
-        pos_temp_files = []
-        neg_temp_files = []
-        
-        for i, p in enumerate(consumer_processes):
-            p.join(timeout=10)
-            if p.is_alive():
-                logging.warning(f"Consumer {i} 강제 종료")
-                p.terminate()
-                p.join()
-            
-            # 임시 파일 경로 수집
-            pos_temp_files.append(pos_file_path + f'.lock_{i}')
-            neg_temp_files.append(neg_file_path + f'.lock_{i}')
-        
-        # 나머지 프로세스들 종료 대기
-        for p in processes:
-            if p not in consumer_processes:
-                p.join(timeout=10)
-                if p.is_alive():
-                    logging.warning(f"강제 종료: {p}")
-                    p.terminate()
-                    p.join()
-        
-        # 임시 파일들을 최종 파일로 병합
-        logging.info("임시 파일들을 최종 파일로 병합 중...")
-        pos_count = merge_temp_files(pos_temp_files, pos_file_path, "Positive")
-        neg_count = merge_temp_files(neg_temp_files, neg_file_path, "Negative")
-        
-        end_time = time.time() - start_time
-        logging.info(f"다중 생산자-소비자 패턴 완료. 소요시간: {end_time:.5f}초")
-        logging.info(f"최종 결과: Positive {pos_count}개, Negative {neg_count}개")
-        
-    except Exception as e:
-        logging.error(f"다중 생산자-소비자 처리 중 오류: {e}")
-        stop_event.set()
-        
-        # 모든 프로세스 강제 종료
-        for p in processes:
-            if p.is_alive():
-                p.terminate()
-                p.join()
-        
-        raise
 
 def main(args):
     LOG_FILE = os.path.join(script_dir , f'{args.model}_result.log')
@@ -751,14 +471,47 @@ def main(args):
             identity_map, backbone ,args.batch_size
         )
 
+    # positive_embs_generator = generate_positive_pairs_embs(identity_map, embeddings)
+    # negative_embs_generator = generate_negative_pairs_embs(identity_map, embeddings, num_negative_pairs)
+
+    positive_pairs_generator = generate_positive_pairs(identity_map)
+    negative_pairs_generator = generate_negative_pairs(identity_map, num_negative_pairs)
 
     del backbone
     gc.collect()
     torch.cuda.empty_cache()
 
-    process_similarities_with_multiproducer(
-        identity_map, embeddings, num_positive_pairs, num_negative_pairs, script_dir
-    )
+    import time
+    start_time = time.time()
+
+    # with Pool(processes=os.cpu_count()) as pool:
+    #     with open(os.path.join(script_dir, 'similarity_for_pair.npy') , 'wb') as f:
+    #         pos_result_gen = pool.imap_unordered(_calculate_similarity_for_pair_embs , positive_embs_generator , chunksize=1000)
+    #         for result in tqdm(pos_result_gen , total=num_positive_pairs , desc= '동일 인물 쌍 계산 및 저장'):
+    #             if result is not None:
+    #                 result.tofile(f)
+
+    #     with open(os.path.join(script_dir , 'negative_for_pair.npy'), 'wb') as f:
+    #         neg_result_gen = pool.imap_unordered(_calculate_similarity_for_pair_embs , negative_embs_generator , chunksize= 1000)
+    #         for result in tqdm(neg_result_gen , total=num_negative_pairs , desc='다른 인물 쌍 계산 및 저장'):
+    #             if result is not None:
+    #                 result.tofile(f)
+
+    with Pool(initializer=init_worker, initargs=(embeddings,)) as pool:
+        with open(os.path.join(script_dir, 'similarity_for_pair.npy') , 'wb') as f:
+            pos_results_gen = pool.imap_unordered(_calculate_similarity_for_pair_images, positive_pairs_generator, chunksize=1000)
+            for result in tqdm(pos_results_gen, total=num_positive_pairs, desc="동일 인물 쌍 계산 및 저장"):
+                if result is not None:
+                    result.tofile(f)
+
+        with open(os.path.join(script_dir , 'negative_for_pair.npy'), 'wb') as f:
+            neg_results_gen = pool.imap_unordered(_calculate_similarity_for_pair_images, negative_pairs_generator, chunksize=1000)
+            for result in tqdm(neg_results_gen, total=num_negative_pairs, desc="다른 인물 쌍 계산 및 저장"):
+                if result is not None:
+                    result.tofile(f)
+
+    end_time = time.time() - start_time
+    logging.info(f"유사도 계산 및 파일 작성 완료. 소요시간: {end_time:.5f}초")
 
     rank_1_accuracy, rank_5_accuracy, cmc_curve, max_rank, total_probes = calculate_identification_metrics(identity_map, embeddings)
 
@@ -908,22 +661,26 @@ def main(args):
 
     logging.info("\n--- 최종 평가 결과 ---")
     if labels.size > 0:
-        fpr, tpr, thresholds = roc_curve(labels, scores)
-        roc_auc = auc(fpr, tpr)
-        
-        frr = 1 - tpr
-        eer_index = np.nanargmin(np.abs(fpr - frr))
-        eer = fpr[eer_index]
-        eer_threshold = thresholds[eer_index]
 
-        tar_at_far_results = {far: np.interp(far, fpr, tpr) for far in args.target_fars}
+        fpr, tpr, thresholds = roc_curve(labels, scores) # 임계점의 변화에따른 본인수락률과 타인수락률의 변화율 
+        # 임계점을 극단적으로 높이면 본인수락률이 높아지지만 타인수락률 역시 높아지기때문에 본인수락률은 높으면서 타인수락률은 낮아지게 구분하는 임계점을 찾습니다
+
+        roc_auc = auc(fpr, tpr) 
         
-        predictions = (scores >= eer_threshold).astype(int)
-        cm = confusion_matrix(labels, predictions)
+        frr = 1 - tpr # 본인거부율 본인인데 본인이라고 인지못하고 거절
+        eer_index = np.nanargmin(np.abs(fpr - frr)) # 타인수락에러율 / 본인거절에러율이 같아질떄의 임계점 X의값
+        eer = fpr[eer_index] # 해당변수 eer(Equal Error Rate) 은 타인수락율과 / 본인거절에러율이 같을때를 정의합니다 Ex) eer이 3%일때 해당모델은 본인거절 또는 타인수락을 100명중에 3명꼴로 진행하며 해당모델의 에러율은 3%입니다
+        eer_threshold = thresholds[eer_index] # 타인수락률과 본인거절율이 같아지는 임계점 X를 정합니다 향후 임계점 X보다 크다면 동일인문 X보다 작다면 다른인물로 판별합니다
+
+        tar_at_far_results = {far: np.interp(far, fpr, tpr) for far in args.target_fars} # FAR(타인수락에러율)을 강제적으로 고정할때 본인수락확률이 얼마인지 알아냅니다 FAR을 0.01%고정(10,000명중 1명꼴로 타인을 본인이라고 잘못승인할때) 본인수락률은?
         
+        predictions = (scores >= eer_threshold).astype(int) # EER을 만족하는 임게점을 가지고 true , postive를 구성합니다
+        cm = confusion_matrix(labels, predictions) # 실제정답과 추측(true , positive)를 통하여 TP , TN , FP , FN 을 구성합니다 본인수락률 , 본인거절율 , 타인수락률 , 타인거절율
+
         tn, fp, fn, tp = cm.ravel() if cm.size == 4 else (0,0,0,0)
 
-        accuracy = (tp + tn) / (tp + tn + fp + fn) if (tp + tn + fp + fn) > 0 else 0
+        accuracy = (tp + tn) / (tp + tn + fp + fn) if (tp + tn + fp + fn) > 0 else 0 
+
         recall = tp / (tp + fn) if (tp + fn) > 0 else 0
         precision = tp / (tp + fp) if (tp + fp) > 0 else 0
         f1_score = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
