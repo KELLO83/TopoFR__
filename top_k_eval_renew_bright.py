@@ -18,7 +18,6 @@ from multiprocessing.pool import Pool
 from datetime import datetime
 from torch.utils.data import Dataset , DataLoader
 import gc
-import albumentations as A
 from bright.model import enhance_net_nopool
 
 try:
@@ -28,13 +27,11 @@ except NameError:
 
 print(f"script dir ---> {script_dir}")
 
+
 class Dataset_load(Dataset):
     def __init__(self, identity_map):
         super().__init__()
         self.all_images = sorted(list(set(itertools.chain.from_iterable(identity_map.values()))))
-        # self.albu_transform = A.Compose([
-        #         A.CLAHE(always_apply=True , clip_limit= 3, tile_grid_size=(8, 8)),
-        #     ])
         
         self.transform = v2.Compose([
             v2.ToImage(), 
@@ -43,43 +40,42 @@ class Dataset_load(Dataset):
             v2.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
         ])
 
-        self.DCE_NET  = enhance_net_nopool(12).cuda()
+        self.DCE_NET = enhance_net_nopool(12).cuda()
         self.DCE_NET.load_state_dict(torch.load('Epoch99.pth'))
+        self.DCE_NET.eval() 
 
     def __len__(self):
         return len(self.all_images)
     
     def __getitem__(self, index):
         image_path = self.all_images[index]
-        image = cv2.imread(image_path) # BGR순서로 읽음..
-        image = cv2.cvtColor(image , cv2.COLOR_BGR2RGB)
+        image = cv2.imread(image_path)  # BGR
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)  
 
-        image_hsv = cv2.cvtColor(image , cv2.COLOR_RGB2HSV)
+        image_hsv = cv2.cvtColor(image, cv2.COLOR_RGB2HSV)
         v_channel = image_hsv[:, :, 2]
         mean_brightness = np.mean(v_channel)
 
         if mean_brightness < 35:
             scale_factor = 12
-
+            
             data_lowlight = image.astype(np.float32) / 255.0
-
             data_lowlight = torch.from_numpy(data_lowlight).float()
 
-            h=(data_lowlight.shape[0]//scale_factor)*scale_factor
-            w=(data_lowlight.shape[1]//scale_factor)*scale_factor
-            data_lowlight = data_lowlight[0:h,0:w,:]
-            data_lowlight = data_lowlight.permute(2,0,1)
-            data_lowlight = data_lowlight.cuda().unsqueeze(0)
-            enhanced_image, _  = self.DCE_NET(data_lowlight)
-
-            enhanced_image = enhanced_image.squeeze(0).permute(1,2,0).cpu().detach().numpy()
+            h = (data_lowlight.shape[0] // scale_factor) * scale_factor
+            w = (data_lowlight.shape[1] // scale_factor) * scale_factor
+            data_lowlight = data_lowlight[0:h, 0:w, :]
+            data_lowlight = data_lowlight.permute(2, 0, 1).cuda().unsqueeze(0)
+            
+            with torch.no_grad():
+                enhanced_image, _ = self.DCE_NET(data_lowlight)
+            enhanced_image = enhanced_image.squeeze(0).permute(1, 2, 0).cpu().detach().numpy()
             enhanced_image = (enhanced_image * 255).astype(np.uint8)
             image = enhanced_image
 
-        # image = self.albu_transform(image=image)['image']
-
         image_tensor = self.transform(image)
         return image_tensor, image_path
+
     
 def find_max_batch_size(model, input_shape, device):
     if device != 'cuda':
@@ -240,22 +236,6 @@ def _calculate_similarity_for_pair_images(pair):
             
     return None
 
-def _calculate_similarity_for_pair_embs(embs_pair):
-    emb1, emb2 = embs_pair
-    
-    if emb1 is not None and emb2 is not None:
-        emb1 = emb1.to(torch.float32)
-        emb2 = emb2.to(torch.float32)
-
-        norm1 = torch.norm(emb1)
-        norm2 = torch.norm(emb2)
-
-        if norm1 > 0 and norm2 > 0:
-            cosine_similarity = torch.dot(emb1, emb2) / (norm1 * norm2)
-            return cosine_similarity.cpu().numpy().astype(np.float16)
-            
-    return None
-
 def calculate_identification_metrics(identity_map, embeddings):
     logging.info("Calculating identification metrics (Rank-k, CMC)...")
 
@@ -352,16 +332,6 @@ def calculate_identification_metrics(identity_map, embeddings):
     logging.info(f"CMC Curve calculated up to rank {max_rank}")
 
     return rank_1_accuracy, rank_5_accuracy, cmc_curve, max_rank, total_probes
-
-def generate_positive_pairs_embs(identity_map, embeddings ):
-    for imgs in identity_map.values():
-        for path1, path2 in itertools.combinations(imgs, 2):
-            emb1 = embeddings.get(path1)
-            emb2 = embeddings.get(path2)
-            if emb1 is not None and emb2 is not None:
-                yield (emb1, emb2)
-
-def generate_negative_pairs_embs(identity_map , embeddings , num_pairs):
     identities = list(identity_map.keys())
     if len(identities) < 2:
         return
@@ -378,13 +348,11 @@ def generate_negative_pairs_embs(identity_map , embeddings , num_pairs):
             yield (emb1 , emb2)
 
 def generate_positive_pairs(identity_map):
-    """동일 인물 쌍을 생성하는 제너레이터"""
     for imgs in identity_map.values():
         for pair in itertools.combinations(imgs, 2):
             yield pair
 
 def generate_negative_pairs(identity_map, num_pairs):
-    """다른 인물 쌍을 생성하는 제너레이터 (중복 허용)"""
     identities = list(identity_map.keys())
     if len(identities) < 2:
         return
@@ -499,8 +467,6 @@ def main(args):
             identity_map, backbone ,args.batch_size
         )
 
-    # positive_embs_generator = generate_positive_pairs_embs(identity_map, embeddings)
-    # negative_embs_generator = generate_negative_pairs_embs(identity_map, embeddings, num_negative_pairs)
 
     positive_pairs_generator = generate_positive_pairs(identity_map)
     negative_pairs_generator = generate_negative_pairs(identity_map, num_negative_pairs)
@@ -511,19 +477,6 @@ def main(args):
 
     import time
     start_time = time.time()
-
-    # with Pool(processes=os.cpu_count()) as pool:
-    #     with open(os.path.join(script_dir, 'similarity_for_pair.npy') , 'wb') as f:
-    #         pos_result_gen = pool.imap_unordered(_calculate_similarity_for_pair_embs , positive_embs_generator , chunksize=1000)
-    #         for result in tqdm(pos_result_gen , total=num_positive_pairs , desc= '동일 인물 쌍 계산 및 저장'):
-    #             if result is not None:
-    #                 result.tofile(f)
-
-    #     with open(os.path.join(script_dir , 'negative_for_pair.npy'), 'wb') as f:
-    #         neg_result_gen = pool.imap_unordered(_calculate_similarity_for_pair_embs , negative_embs_generator , chunksize= 1000)
-    #         for result in tqdm(neg_result_gen , total=num_negative_pairs , desc='다른 인물 쌍 계산 및 저장'):
-    #             if result is not None:
-    #                 result.tofile(f)
 
     with Pool(initializer=init_worker, initargs=(embeddings,)) as pool:
         with open(os.path.join(script_dir, 'similarity_for_pair.npy') , 'wb') as f:
