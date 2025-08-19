@@ -45,7 +45,6 @@ class Dataset_load(Dataset):
         image_path = self.all_images[index]
         image = cv2.imread(image_path) # BGR순서로 읽음..
         image = cv2.cvtColor(image , cv2.COLOR_BGR2RGB)
-        image = self.albu_transform(image=image)['image']
         image_tensor = self.transform(image)
         return image_tensor, image_path
     
