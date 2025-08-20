@@ -14,7 +14,7 @@ import logging
 import torchvision.transforms.v2 as v2
 import numpy as np
 from backbones.iresnet import IResNet , IBasicBlock
-from multiprocessing import Process, Queue
+from multiprocessing import Process, Queue 
 from datetime import datetime
 from torch.utils.data import Dataset , DataLoader
 import gc
@@ -287,20 +287,31 @@ def calculate_identification_metrics(identity_map, embeddings):
 
     return rank_1_accuracy, rank_5_accuracy, cmc_curve, max_rank, total_probes
 
-def generate_negative_pairs(identity_map, num_pairs):
-    identities = list(identity_map.keys())
-    if len(identities) < 2:
-        return
 
+def generate_positive_pairs(identity_map, producer_id, num_producers):
+
+    identities = list(identity_map.values())
+    for i in range(producer_id, len(identities), num_producers):
+        imgs = identities[i]
+        if len(imgs) >= 2:
+            for pair in itertools.combinations(imgs, 2):
+                yield pair
+
+def generate_negative_pairs(identity_map, num_pairs, pid):
+    pid_seed = 42 + pid  
+    random.seed(pid_seed)
+    np.random.seed(pid_seed)
+    
+    identities = list(identity_map.keys())
     for _ in range(num_pairs):
-        id1, id2 = random.sample(identities, 2)
-        img1 = random.choice(identity_map[id1])
-        img2 = random.choice(identity_map[id2])
+        id1, id2 = random.sample(identities, 2)  
+        img1 = random.choice(identity_map[id1])   
+        img2 = random.choice(identity_map[id2])   
         yield (img1, img2)
 
-def producer_task_negative(queue, identity_map, chunk_size, num_pairs_to_generate):
+def producer_task_negative(queue, identity_map, chunk_size, num_pairs_to_generate , pid):
     chunk = []
-    pair_generator = generate_negative_pairs(identity_map, num_pairs_to_generate)
+    pair_generator = generate_negative_pairs(identity_map, num_pairs_to_generate , pid)
 
     for pair in pair_generator:
         chunk.append(pair)
@@ -311,14 +322,20 @@ def producer_task_negative(queue, identity_map, chunk_size, num_pairs_to_generat
     if chunk:
         queue.put(chunk)
 
-def generate_positive_pairs(identity_map, producer_id, num_producers):
+def producer_task(queue, identity_map, chunk_size , producer_id , num_producers ):
+    chunk = []
 
-    identities = list(identity_map.values())
-    for i in range(producer_id, len(identities), num_producers):
-        imgs = identities[i]
-        if len(imgs) >= 2:
-            for pair in itertools.combinations(imgs, 2):
-                yield pair
+    pair_generator = generate_positive_pairs(identity_map , producer_id  , num_producers)
+
+    for pair in pair_generator:
+        chunk.append(pair)
+        if len(chunk) >= chunk_size:
+            queue.put(chunk)  
+            chunk = []
+
+    if chunk:
+        queue.put(chunk)
+
 
 def _calculate_similarity_for_pair_images(pair , embeddings):
     img1_path, img2_path = pair
@@ -339,53 +356,49 @@ def _calculate_similarity_for_pair_images(pair , embeddings):
             
     return None
 
-
-def producer_task(queue, identity_map, chunk_size , producer_id , num_producers ):
-    chunk = []
-
-    pair_generator = generate_positive_pairs(identity_map , producer_id  , num_producers)
-
-    for pair in pair_generator:
-        chunk.append(pair)
-        if len(chunk) >= chunk_size:
-            queue.put(chunk)  
-            chunk = []
-
-    if chunk:
-        queue.put(chunk)
-
 def writer_task(results_queue, output_file_path, total_pairs, description):
-    with open(output_file_path, 'wb') as f, tqdm(total=total_pairs, desc=description, unit='pair') as pbar:
+    all_results = []
+    with tqdm(total=total_pairs, desc=description, unit='pair') as pbar:
         while True:
-            result = results_queue.get()
-            if result is None:
+            results = results_queue.get()
+            if results is None:
                 break
-            result.tofile(f)
-            pbar.update(1)
+            all_results.extend(results)
+            pbar.update(len(results))
+    
+    if all_results:
+        np_results = np.array(all_results, dtype=np.float16)
+        np_results.tofile(output_file_path)
+    else:
+        np.array([], dtype=np.float16).tofile(output_file_path)
 
 def consumer_task(work_queue, results_queue, embeddings):
+    buffer = []
     while True:
         chunk = work_queue.get()
         if chunk is None:
+            if buffer:
+                results_queue.put(buffer)
             break
         
         for pair in chunk:
             similarity = _calculate_similarity_for_pair_images(pair, embeddings)
             if similarity is not None:
-                results_queue.put(similarity)
+                buffer.append(similarity)
+
 
 def process_similarities_with_multiproducer(identity_map, embeddings, num_positive_pairs, num_negative_pairs, script_dir):
 
-    num_producers = max(2 , os.cpu_count() // 5) 
+    num_producers = 2
     num_consumers = os.cpu_count() - num_producers
-    chunk_size = 5000  
 
-    queue_size = max(2000, (num_positive_pairs + num_negative_pairs) // (chunk_size * 5))  
+    chunk_size = 5000  
+    queue_size = 100000
     
     logging.info(f"다중 생산자-소비자 패턴 시작:")
     logging.info(f"  - 생산자 프로세스: {num_producers}개")
     logging.info(f"  - 소비자 프로세스: {num_consumers}개")
-    logging.info(f"  - 청크 크기: {chunk_size} (더 작은 배치로 빈번한 처리)")
+    logging.info(f"  - 청크 크기: {chunk_size} ")
     logging.info(f"  - 큐 크기: {queue_size}")
     logging.info(f"  - 예상 총 처리량: Positive {num_positive_pairs}, Negative {num_negative_pairs}")
     
@@ -422,9 +435,10 @@ def process_similarities_with_multiproducer(identity_map, embeddings, num_positi
 
     result_queue.put(None)
     writer_pos.join()
+    data_queue.close()
+    result_queue.close()
     print("동일 인물 쌍 처리 완료.")
 
-    # --- 2. 다른 인물 쌍 처리 ---
     print("다른 인물 쌍 처리를 시작합니다.")
 
     producer_process = []
@@ -441,7 +455,7 @@ def process_similarities_with_multiproducer(identity_map, embeddings, num_positi
 
             num_to_generate = total_neg_pairs - (neg_pairs_per_producer * (num_producers - 1))
 
-        p = Process(target=producer_task_negative , args=(data_queue , identity_map , chunk_size , num_to_generate))
+        p = Process(target=producer_task_negative , args=(data_queue , identity_map , chunk_size , num_to_generate , producer_id))
         producer_process.append(p)
         p.start()
     
@@ -571,18 +585,21 @@ def main(args):
             identity_map, backbone ,args.batch_size
         )
 
-
+    start_time = time.time()
     del backbone
     gc.collect()
     torch.cuda.empty_cache()
-
-    start_time = time.time()
 
     process_similarities_with_multiproducer(
         identity_map, embeddings, num_positive_pairs, num_negative_pairs, script_dir
     )
 
-    logging.info(f"유사도 비교(동일인물 다른인물) 소요시간 {time.time() - start_time : .2f}")
+
+    running_time = time.time() - start_time
+    logging.info(f"유사도 비교(동일인물 다른인물) 소요시간 {running_time : .2f}")
+
+    with open(LOG_FILE ,'a') as log_file:
+        log_file.write(f"유사도 비교(동일인물 다른인물) 소요시간 {running_time : .2f}")
 
     rank_1_accuracy, rank_5_accuracy, cmc_curve, max_rank, total_probes = calculate_identification_metrics(identity_map, embeddings)
 

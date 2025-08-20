@@ -57,26 +57,26 @@ class Dataset_load(Dataset):
         image = cv2.imread(image_path)  # BGR
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)  
 
-        image_hsv = cv2.cvtColor(image, cv2.COLOR_RGB2HSV)
-        v_channel = image_hsv[:, :, 2]
-        mean_brightness = np.mean(v_channel)
+        # image_hsv = cv2.cvtColor(image, cv2.COLOR_RGB2HSV)
+        # v_channel = image_hsv[:, :, 2]
+        # mean_brightness = np.mean(v_channel)
 
-        if mean_brightness < 35:
-            scale_factor = 12
-            
-            data_lowlight = image.astype(np.float32) / 255.0
-            data_lowlight = torch.from_numpy(data_lowlight).float()
+        # if mean_brightness < 35:
+        scale_factor = 12
+        
+        data_lowlight = image.astype(np.float32) / 255.0
+        data_lowlight = torch.from_numpy(data_lowlight).float()
 
-            h = (data_lowlight.shape[0] // scale_factor) * scale_factor
-            w = (data_lowlight.shape[1] // scale_factor) * scale_factor
-            data_lowlight = data_lowlight[0:h, 0:w, :]
-            data_lowlight = data_lowlight.permute(2, 0, 1).cuda().unsqueeze(0)
-            
-            with torch.no_grad():
-                enhanced_image, _ = self.DCE_NET(data_lowlight)
-            enhanced_image = enhanced_image.squeeze(0).permute(1, 2, 0).cpu().detach().numpy()
-            enhanced_image = (enhanced_image * 255).astype(np.uint8)
-            image = enhanced_image
+        h = (data_lowlight.shape[0] // scale_factor) * scale_factor
+        w = (data_lowlight.shape[1] // scale_factor) * scale_factor
+        data_lowlight = data_lowlight[0:h, 0:w, :]
+        data_lowlight = data_lowlight.permute(2, 0, 1).cuda().unsqueeze(0)
+        
+        with torch.no_grad():
+            enhanced_image, _ = self.DCE_NET(data_lowlight)
+        enhanced_image = enhanced_image.squeeze(0).permute(1, 2, 0).cpu().detach().numpy()
+        enhanced_image = (enhanced_image * 255).astype(np.uint8)
+        image = enhanced_image
 
 
         image_tensor = self.transform(image)
@@ -485,6 +485,10 @@ def main(args):
 
     end_time = time.time() - start_time
     logging.info(f"유사도 계산 및 파일 작성 완료. 소요시간: {end_time:.5f}초")
+
+    with open(LOG_FILE ,'a') as log_file:
+        log_file.write(f"유사도 비교(동일인물 다른인물) 소요시간 {end_time : .2f}")
+
 
     rank_1_accuracy, rank_5_accuracy, cmc_curve, max_rank, total_probes = calculate_identification_metrics(identity_map, embeddings)
 

@@ -448,7 +448,12 @@ def main(args):
                 if result is not None:
                     result.tofile(f)
 
-    logging.info(f"유사도 비교(동일인물 다른인물) 소요시간 {time.time() - start_time : .2f}")
+    running_time = time.time() - start_time
+    logging.info(f"유사도 비교(동일인물 다른인물) 소요시간 {running_time : .2f}")
+
+    with open(LOG_FILE ,'a') as log_file:
+        log_file.write(f"유사도 비교(동일인물 다른인물) 소요시간 {running_time : .2f}")
+
 
     rank_1_accuracy, rank_5_accuracy, cmc_curve, max_rank, total_probes = calculate_identification_metrics(identity_map, embeddings)
 
