@@ -14,13 +14,10 @@ import logging
 import torchvision.transforms.v2 as v2
 import numpy as np
 from backbones.iresnet import IResNet , IBasicBlock
-from multiprocessing.pool import Pool
-from multiprocessing import Process, Queue, Event
+from multiprocessing import Process, Queue
 from datetime import datetime
 from torch.utils.data import Dataset , DataLoader
 import gc
-import threading
-import queue
 import time
 import sys
 
@@ -379,7 +376,7 @@ def consumer_task(work_queue, results_queue, embeddings):
 
 def process_similarities_with_multiproducer(identity_map, embeddings, num_positive_pairs, num_negative_pairs, script_dir):
 
-    num_producers = max(2 , os.cpu_count() // 4) 
+    num_producers = max(2 , os.cpu_count() // 5) 
     num_consumers = os.cpu_count() - num_producers
     chunk_size = 5000  
 
@@ -579,9 +576,13 @@ def main(args):
     gc.collect()
     torch.cuda.empty_cache()
 
+    start_time = time.time()
+
     process_similarities_with_multiproducer(
         identity_map, embeddings, num_positive_pairs, num_negative_pairs, script_dir
     )
+
+    logging.info(f"유사도 비교(동일인물 다른인물) 소요시간 {time.time() - start_time : .2f}")
 
     rank_1_accuracy, rank_5_accuracy, cmc_curve, max_rank, total_probes = calculate_identification_metrics(identity_map, embeddings)
 
@@ -847,7 +848,7 @@ def plot_roc_curve(fpr, tpr, roc_auc, model_name, excel_path):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="SEvaluation Script")
-    parser.add_argument('--model',type=str , default='Glint360K_R50_TopoFR_9727', choices=['Glint360K_R200_TopoFR' , 'Glint360K_R50_TopoFR_9727', 'MS1MV2_R200_TopoFR', 'Glint360K_R100_TopoFR_9760'],)
+    parser.add_argument('--model',type=str , default='Glint360K_R200_TopoFR', choices=['Glint360K_R200_TopoFR' , 'Glint360K_R50_TopoFR_9727', 'MS1MV2_R200_TopoFR', 'Glint360K_R100_TopoFR_9760'],)
     parser.add_argument("--data_path", type=str, default="/home/ubuntu/KOR_DATA/일반/kor_data_sorting", help="평가할 데이터셋의 루트 폴더")
     parser.add_argument("--excel_path", type=str, default="evaluation_results.xlsx", help="결과를 저장할 Excel 파일 이름")
     parser.add_argument("--target_fars", nargs='+', type=float, default=[0.01, 0.001, 0.0001], help="TAR을 계산할 FAR 목표값들")
@@ -855,7 +856,7 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=512, help="임베딩 추출 시 배치 크기")
     parser.add_argument('--load_cache' , type=str , default = None ,help="임베딩 캐시경로")
     parser.add_argument('--save_cache' , action='store_true')
-    parser.add_argument('--split',default=4 , help='전체클래스수 / N ')
+    parser.add_argument('--split',default=1 , help='전체클래스수 / N ')
     args = parser.parse_args()
 
     #args.data_path = '/home/ubuntu/KOR_DATA/kor_data_full_Middle_Resolution_aligend'

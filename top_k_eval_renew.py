@@ -448,8 +448,7 @@ def main(args):
                 if result is not None:
                     result.tofile(f)
 
-    end_time = time.time() - start_time
-    logging.info(f"유사도 계산 및 파일 작성 완료. 소요시간: {end_time:.5f}초")
+    logging.info(f"유사도 비교(동일인물 다른인물) 소요시간 {time.time() - start_time : .2f}")
 
     rank_1_accuracy, rank_5_accuracy, cmc_curve, max_rank, total_probes = calculate_identification_metrics(identity_map, embeddings)
 
@@ -727,7 +726,7 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=512, help="임베딩 추출 시 배치 크기")
     parser.add_argument('--load_cache' , type=str , default = None ,help="임베딩 캐시경로")
     parser.add_argument('--save_cache' , action='store_true')
-    parser.add_argument('--split',default=4 , help='전체클래스수 / N ')
+    parser.add_argument('--split',default=1 , help='전체클래스수 / N ')
     args = parser.parse_args()
 
     #args.data_path = '/home/ubuntu/KOR_DATA/kor_data_full_Middle_Resolution_aligend'
