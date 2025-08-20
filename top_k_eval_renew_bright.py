@@ -67,11 +67,11 @@ class Dataset_load(Dataset):
         )
 
 
-        weight = 'NTIRE.pth'
+        weight = 'SDSD_outdoor.pth'
         weight_data = torch.load(weight, map_location='cpu')
         state_dict = weight_data['params']
         load_result = self.retinex.load_state_dict(state_dict , strict=True)
-        logging.info(f'RetinexFormer 로딩 성공... {load_result}')
+        logging.info(f'RetinexFormer 로딩 성공... {str(load_result)}')
         self.retinex.to('cuda')
         self.retinex.eval()
 
@@ -417,7 +417,7 @@ def generate_negative_pairs(identity_map, num_pairs):
 
 def main(args):
     LOG_FILE = os.path.join(script_dir , f'{args.model}_result.log')
-    with open(f"{LOG_FILE}" , 'a') as log_file:
+    with open(f"{LOG_FILE}" , 'a' , encoding='utf-8') as log_file:
         log_file.write(f"\n시작시간 : {datetime.now().strftime('%Y.%m.%d - %H:%M:%S')}\n")
 
     torch.backends.cudnn.benchmark = True
@@ -543,11 +543,12 @@ def main(args):
                 if result is not None:
                     result.tofile(f)
 
-    end_time = time.time() - start_time
-    logging.info(f"유사도 계산 및 파일 작성 완료. 소요시간: {end_time:.5f}초")
+    running_time = time.time() - start_time
+    logging.info(f"유사도 비교(동일인물 다른인물) 소요시간 {running_time : .2f}")
 
-    with open(LOG_FILE ,'a') as log_file:
-        log_file.write(f"유사도 비교(동일인물 다른인물) 소요시간 {end_time : .2f}")
+    with open(LOG_FILE ,'a' ,encoding='utf8') as log_file:
+        log_file.write(f"유사도 비교(동일인물 다른인물) 소요시간 {running_time : .2f}")
+
 
 
     rank_1_accuracy, rank_5_accuracy, cmc_curve, max_rank, total_probes = calculate_identification_metrics(identity_map, embeddings)
@@ -558,7 +559,7 @@ def main(args):
             print(f"Rank-5 Accuracy: {rank_5_accuracy:.4f}")
             print(f"총 프로브 이미지 수: {total_probes}")
 
-            with open(LOG_FILE, 'a') as log_file:
+            with open(LOG_FILE, 'a' , encoding='utf8') as log_file:
                 log_file.write(f"\n얼굴 식별 성능:\n")
                 log_file.write(f"Rank-1 Accuracy: {rank_1_accuracy:.4f}\n")
                 log_file.write(f"Rank-5 Accuracy: {rank_5_accuracy:.4f}\n")
@@ -648,7 +649,7 @@ def main(args):
 
 
 
-        with open(LOG_FILE, 'a') as log_file:
+        with open(LOG_FILE, 'a',encoding='utf8') as log_file:
             log_file.write(f"\n--- 유사도 분포 분석 ---\n")  
             log_file.write(f"🔍 디버깅 정보:\n")          
             log_file.write(f"   - 전체 임베딩 수: {num_total_embeddings}\n")
@@ -684,7 +685,7 @@ def main(args):
         logging.info(f"len pos : {len(pos_similarities)}, len neg: {len(neg_similarities)}")
         exit(0)
 
-    with open(LOG_FILE, 'a') as log_file:
+    with open(LOG_FILE, 'a' , encoding='utf-8') as log_file:
         log_file.write(f"   - 양성 쌍 유사도 수 (필터링 후): {len(pos_similarities)}\n")
         log_file.write(f"   - 음성 쌍 유사도 수 (필터링 후): {len(neg_similarities)}\n")
     
@@ -729,7 +730,7 @@ def main(args):
         for far, tar in tar_at_far_results.items():
             print(f"  - TAR @ FAR {far*100:g}%: {tar:.4f}")
         
-        with open(LOG_FILE, 'a') as log_file:
+        with open(LOG_FILE, 'a' , encoding='utf-8') as log_file:
             log_file.write(f"\n평가 결과:\n")
             log_file.write(f"전체 클래스수  : {NUM_FOLDER_TO_PROCESS}  전체 사람 이미지수 : {TOTAL_IMAGE_LEN}\n")
             log_file.write(f"ROC-AUC: {roc_auc:.4f}, EER: {eer:.4f} (Threshold: {eer_threshold:.4f})\n")
@@ -818,7 +819,7 @@ def plot_roc_curve(fpr, tpr, roc_auc, model_name, excel_path):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="SEvaluation Script")
-    parser.add_argument('--model',type=str , default='Glint360K_R200_TopoFR', choices=['Glint360K_R200_TopoFR' , 'Glint360K_R50_TopoFR_9727', 'MS1MV2_R200_TopoFR', 'Glint360K_R100_TopoFR_9760'],)
+    parser.add_argument('--model',type=str , default='Glint360K_R50_TopoFR_9727', choices=['Glint360K_R200_TopoFR' , 'Glint360K_R50_TopoFR_9727', 'MS1MV2_R200_TopoFR', 'Glint360K_R100_TopoFR_9760'],)
     parser.add_argument("--data_path", type=str, default="/home/ubuntu/KOR_DATA/일반/kor_data_sorting", help="평가할 데이터셋의 루트 폴더")
     parser.add_argument("--excel_path", type=str, default="evaluation_results.xlsx", help="결과를 저장할 Excel 파일 이름")
     parser.add_argument("--target_fars", nargs='+', type=float, default=[0.01, 0.001, 0.0001], help="TAR을 계산할 FAR 목표값들")
@@ -830,7 +831,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     #args.data_path = '/home/ubuntu/KOR_DATA/kor_data_full_Middle_Resolution_aligend'
-
+    args.data_path = '/home/ubuntu/KOR_DATA/High_resolution_row_bright'
     for key , values in args.__dict__.items():
         print(f"key {key}  :  {values}")
 
