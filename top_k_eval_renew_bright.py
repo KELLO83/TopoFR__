@@ -18,7 +18,8 @@ from multiprocessing.pool import Pool
 from datetime import datetime
 from torch.utils.data import Dataset , DataLoader
 import gc
-from bright.model import enhance_net_nopool
+from bright.model import enhance_net_nopool 
+from bright.RetinexFormer_arch import RetinexFormer
 import albumentations as A
 
 try:
@@ -45,9 +46,66 @@ class Dataset_load(Dataset):
         self.DCE_NET.load_state_dict(torch.load('Epoch99.pth'))
         self.DCE_NET.eval() 
 
-        self.clahe_transform = A.Compose([
-            A.CLAHE(clip_limit=3, tile_grid_size=(8, 8) , p=1)
-        ]) 
+        # self.clahe_transform = A.Compose([
+        #     A.CLAHE(clip_limit=3, tile_grid_size=(8, 8) , p=1)])  
+        # #  A.RandomGamma(gamma_limit=(50, 150), p=1), # 감마 값조절 
+
+
+        in_channels = 3
+        out_channels = 3
+        n_feat = 40
+        stage = 1
+        num_blocks = [1, 2, 2]
+
+
+        self.retinex = RetinexFormer(
+            in_channels=in_channels,
+            out_channels= out_channels ,
+            n_feat= n_feat,
+            stage = stage,
+            num_blocks= num_blocks
+        )
+
+
+        weight = 'NTIRE.pth'
+        weight_data = torch.load(weight, map_location='cpu')
+        state_dict = weight_data['params']
+        load_result = self.retinex.load_state_dict(state_dict , strict=True)
+        logging.info(f'RetinexFormer 로딩 성공... {load_result}')
+        self.retinex.to('cuda')
+        self.retinex.eval()
+
+
+    def retinex_preprocess(self , image):
+        original_h, original_w = image.shape[:2]
+        pad_h = (8 - original_h % 8) % 8
+        pad_w = (8 - original_w % 8) % 8
+        
+        if pad_h > 0 or pad_w > 0:
+            image = cv2.copyMakeBorder(image, 0, pad_h, 0, pad_w, cv2.BORDER_REFLECT)
+        
+        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        
+        image_norm = image_rgb.astype(np.float32) / 255.0
+        
+        image_tensor = torch.from_numpy(image_norm).permute(2, 0, 1)
+        
+        input_tensor = image_tensor.unsqueeze(0)
+
+        input_tensor = input_tensor.to('cuda')
+
+        with torch.no_grad():
+            enhanced = self.retinex(input_tensor)
+        
+        enhanced = enhanced.squeeze(0).cpu()
+        
+        enhanced = enhanced.permute(1, 2, 0).numpy()
+        
+        enhanced = np.clip(enhanced * 255.0, 0, 255).astype(np.uint8)
+        if pad_h > 0 or pad_w > 0:
+            enhanced = enhanced[:original_h, :original_w]
+
+        return enhanced
 
     def __len__(self):
         return len(self.all_images)
@@ -72,12 +130,14 @@ class Dataset_load(Dataset):
         # data_lowlight = data_lowlight[0:h, 0:w, :]
         # data_lowlight = data_lowlight.permute(2, 0, 1).cuda().unsqueeze(0)
 
-        image = self.clahe_transform(image=image)['image']
+        # image = self.clahe_transform(image=image)['image']
         # with torch.no_grad():
         #     enhanced_image, _ = self.DCE_NET(data_lowlight)
         # enhanced_image = enhanced_image.squeeze(0).permute(1, 2, 0).cpu().detach().numpy()
         # enhanced_image = (enhanced_image * 255).astype(np.uint8)
         # image = enhanced_image
+
+        image = self.retinex_preprocess(image)
 
         image_tensor = self.transform(image)
         return image_tensor, image_path
@@ -766,7 +826,7 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=512, help="임베딩 추출 시 배치 크기")
     parser.add_argument('--load_cache' , type=str , default = None ,help="임베딩 캐시경로")
     parser.add_argument('--save_cache' , action='store_true')
-    parser.add_argument('--split',default=1 , type=int ,help='전체클래스수 / N ')
+    parser.add_argument('--split',default=10 , type=int ,help='전체클래스수 / N ')
     args = parser.parse_args()
 
     #args.data_path = '/home/ubuntu/KOR_DATA/kor_data_full_Middle_Resolution_aligend'

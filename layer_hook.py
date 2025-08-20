@@ -42,6 +42,7 @@ except FileNotFoundError:
 
 
 feature_maps = []
+print(backbone)
 def hook_fn(module, input, output): feature_maps.append(output)
 
 
@@ -50,7 +51,7 @@ handle = target_layer.register_forward_hook(hook_fn)
 
 
 from glob import glob
-file_list = glob('19082031/*.jpg')
+file_list = glob('high_view/*.jpg')
 
 for image_path in file_list:
     # 각 이미지마다 feature_maps 초기화
@@ -71,10 +72,11 @@ for image_path in file_list:
             print("훅을 통해 특징 맵을 얻지 못했습니다. 대상 레이어를 확인하세요.")
         else:
             last_feature_map = feature_maps[-1]
-            print(f"{image_path} - 특징맵 크기: {last_feature_map.shape}")
+            print(f"{image_path} - 특징맵 크기: {last_feature_map.shape}") # 1 512 ,7 ,7 
 
             cam = torch.mean(last_feature_map, dim=1).squeeze().cpu().numpy()
-            cam = (cam - np.min(cam)) / (np.max(cam) - np.min(cam))
+            cam = (cam - np.min(cam)) / (np.max(cam) - np.min(cam)) # min_max 정규화
+            print(cam.shape)
 
             original_img_rgb = cv2.cvtColor(original_img, cv2.COLOR_BGR2RGB)
             h, w, _ = original_img_rgb.shape
