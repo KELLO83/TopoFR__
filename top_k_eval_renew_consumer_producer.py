@@ -357,23 +357,21 @@ def _calculate_similarity_for_pair_images(pair , embeddings):
     return None
 
 def writer_task(results_queue, output_file_path, total_pairs, description):
-    all_results = []
-    with tqdm(total=total_pairs, desc=description, unit='pair') as pbar:
+    with open(output_file_path, 'wb') as f, tqdm(total=total_pairs, desc=description, unit='pair') as pbar:
         while True:
             results = results_queue.get()
             if results is None:
                 break
-            all_results.extend(results)
-            pbar.update(len(results))
-    
-    if all_results:
-        np_results = np.array(all_results, dtype=np.float16)
-        np_results.tofile(output_file_path)
-    else:
-        np.array([], dtype=np.float16).tofile(output_file_path)
 
-def consumer_task(work_queue, results_queue, embeddings):
+            if results:
+                np_results = np.array(results, dtype=np.float16)
+                np_results.tofile(f) 
+                f.flush() 
+                pbar.update(len(results))
+
+def consumer_task(work_queue, results_queue, embeddings , chunk_size = 10000):
     buffer = []
+    buffer_size = chunk_size  
     while True:
         chunk = work_queue.get()
         if chunk is None:
@@ -386,14 +384,18 @@ def consumer_task(work_queue, results_queue, embeddings):
             if similarity is not None:
                 buffer.append(similarity)
 
+            if len(buffer) >= buffer_size:
+                results_queue.put(buffer)
+                buffer = [] 
+
 
 def process_similarities_with_multiproducer(identity_map, embeddings, num_positive_pairs, num_negative_pairs, script_dir):
 
     num_producers = 2
     num_consumers = os.cpu_count() - num_producers
 
-    chunk_size = 5000  
-    queue_size = 100000
+    chunk_size = 5000 * 10
+    queue_size = 100000 * 10
     
     logging.info(f"다중 생산자-소비자 패턴 시작:")
     logging.info(f"  - 생산자 프로세스: {num_producers}개")
@@ -417,7 +419,7 @@ def process_similarities_with_multiproducer(identity_map, embeddings, num_positi
         p.start() 
     
     for _ in range(num_consumers):
-        c = Process(target=consumer_task , args=(data_queue , result_queue , embeddings))
+        c = Process(target=consumer_task , args=(data_queue , result_queue , embeddings , chunk_size))
         consumer_process.append(c)
         c.start()
 
@@ -460,7 +462,7 @@ def process_similarities_with_multiproducer(identity_map, embeddings, num_positi
         p.start()
     
     for _ in range(num_consumers):
-        c = Process(target=consumer_task , args=(data_queue , result_queue , embeddings))
+        c = Process(target=consumer_task , args=(data_queue , result_queue , embeddings , chunk_size))
         consumer_process.append(c)
         c.start()
 
