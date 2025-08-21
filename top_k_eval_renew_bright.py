@@ -46,9 +46,9 @@ class Dataset_load(Dataset):
         self.DCE_NET.load_state_dict(torch.load('Epoch99.pth'))
         self.DCE_NET.eval() 
 
-        self.clahe_transform = A.Compose([
-            A.CLAHE(clip_limit=3, tile_grid_size=(8, 8) , p=1)])  
-        #  A.RandomGamma(gamma_limit=(50, 150), p=1), # 감마 값조절 
+        # self.clahe_transform = A.Compose([
+        #     A.CLAHE(clip_limit=3, tile_grid_size=(8, 8) , p=1)])  
+        # #  A.RandomGamma(gamma_limit=(50, 150), p=1), # 감마 값조절 
 
 
         in_channels = 3
@@ -67,7 +67,7 @@ class Dataset_load(Dataset):
         )
 
 
-        weight = 'NTIRE.pth'
+        weight = 'SDSD_outdoor.pth'
         weight_data = torch.load(weight, map_location='cpu')
         state_dict = weight_data['params']
         load_result = self.retinex.load_state_dict(state_dict , strict=True)
@@ -130,14 +130,14 @@ class Dataset_load(Dataset):
         # data_lowlight = data_lowlight[0:h, 0:w, :]
         # data_lowlight = data_lowlight.permute(2, 0, 1).cuda().unsqueeze(0)
 
-        image = self.clahe_transform(image=image)['image']
+        # image = self.clahe_transform(image=image)['image']
         # with torch.no_grad():
         #     enhanced_image, _ = self.DCE_NET(data_lowlight)
         # enhanced_image = enhanced_image.squeeze(0).permute(1, 2, 0).cpu().detach().numpy()
         # enhanced_image = (enhanced_image * 255).astype(np.uint8)
         # image = enhanced_image
 
-        # image = self.retinex_preprocess(image)
+        image = self.retinex_preprocess(image)
 
         image_tensor = self.transform(image)
         return image_tensor, image_path
