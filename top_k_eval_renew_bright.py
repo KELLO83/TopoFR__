@@ -67,7 +67,7 @@ class Dataset_load(Dataset):
         )
 
 
-        weight = 'SDSD_outdoor.pth'
+        weight = 'NTIRE.pth'
         weight_data = torch.load(weight, map_location='cpu')
         state_dict = weight_data['params']
         load_result = self.retinex.load_state_dict(state_dict , strict=True)

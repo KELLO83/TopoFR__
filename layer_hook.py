@@ -41,21 +41,31 @@ except FileNotFoundError:
 
 
 
-feature_maps = []
-print(backbone)
-def hook_fn(module, input, output): feature_maps.append(output)
+feature_maps_layer3 = []
+feature_maps_layer4 = []
 
+def hook_fn_layer3(module, input, output): 
+    feature_maps_layer3.append(output)
 
-target_layer = backbone.layer4
-handle = target_layer.register_forward_hook(hook_fn)
+def hook_fn_layer4(module, input, output): 
+    feature_maps_layer4.append(output)
+
+# 두 레이어에 훅 등록
+target_layer3 = backbone.layer3
+target_layer4 = backbone.layer4
+handle3 = target_layer3.register_forward_hook(hook_fn_layer3)
+handle4 = target_layer4.register_forward_hook(hook_fn_layer4)
 
 
 from glob import glob
-file_list = glob('high_view/*.jpg')
+file_list = glob('19082031/*.jpg')
 
+cv2.namedWindow('l3',cv2.WINDOW_NORMAL)
+cv2.namedWindow('l4',cv2.WINDOW_NORMAL)
 for image_path in file_list:
     # 각 이미지마다 feature_maps 초기화
-    feature_maps.clear()
+    feature_maps_layer3.clear()
+    feature_maps_layer4.clear()
     
     original_img = cv2.imread(image_path)
 
@@ -68,32 +78,49 @@ for image_path in file_list:
         with torch.no_grad():
             output = backbone(input_tensor)
 
-        if not feature_maps:
+        if not feature_maps_layer3 or not feature_maps_layer4:
             print("훅을 통해 특징 맵을 얻지 못했습니다. 대상 레이어를 확인하세요.")
         else:
-            last_feature_map = feature_maps[-1]
-            print(f"{image_path} - 특징맵 크기: {last_feature_map.shape}") # 1 512 ,7 ,7 
+            # Layer3 처리
+            layer3_feature_map = feature_maps_layer3[-1]
+            print(f"{image_path} - Layer3 특징맵 크기: {layer3_feature_map.shape}")
 
-            cam = torch.mean(last_feature_map, dim=1).squeeze().cpu().numpy()
-            cam = (cam - np.min(cam)) / (np.max(cam) - np.min(cam)) # min_max 정규화
-            print(cam.shape)
+            cam3 = torch.mean(layer3_feature_map, dim=1).squeeze().cpu().numpy()
+            cam3 = (cam3 - np.min(cam3)) / (np.max(cam3) - np.min(cam3))
 
+            # Layer4 처리
+            layer4_feature_map = feature_maps_layer4[-1]
+            print(f"{image_path} - Layer4 특징맵 크기: {layer4_feature_map.shape}")
+
+            cam4 = torch.mean(layer4_feature_map, dim=1).squeeze().cpu().numpy()
+            cam4 = (cam4 - np.min(cam4)) / (np.max(cam4) - np.min(cam4))
+
+            # 원본 이미지 준비
             original_img_rgb = cv2.cvtColor(original_img, cv2.COLOR_BGR2RGB)
             h, w, _ = original_img_rgb.shape
-            heatmap = cv2.resize(cam, (w, h))
-            heatmap = np.uint8(255 * heatmap)
 
-            heatmap_color = cv2.applyColorMap(heatmap, cv2.COLORMAP_JET)
-            superimposed_img = cv2.addWeighted(original_img_rgb, 0.5, heatmap_color, 0.5, 0)
+            # Layer3 히트맵 생성
+            heatmap3 = cv2.resize(cam3, (w, h))
+            heatmap3 = np.uint8(255 * heatmap3)
+            heatmap3_color = cv2.applyColorMap(heatmap3, cv2.COLORMAP_JET)
+            superimposed3 = cv2.addWeighted(original_img_rgb, 0.5, heatmap3_color, 0.5, 0)
 
-            cv2.namedWindow("sup",cv2.WINDOW_NORMAL)
-            cv2.imshow('sup',superimposed_img)
+            # Layer4 히트맵 생성
+            heatmap4 = cv2.resize(cam4, (w, h))
+            heatmap4 = np.uint8(255 * heatmap4)
+            heatmap4_color = cv2.applyColorMap(heatmap4, cv2.COLORMAP_JET)
+            superimposed4 = cv2.addWeighted(original_img_rgb, 0.5, heatmap4_color, 0.5, 0)
+            
             key = cv2.waitKey(0)
             if key == 27:  # ESC 키로 종료
                 break
 
+            cv2.imshow("l3",superimposed3)
+            cv2.imshow("l4",superimposed4)
+
 # 모든 이미지 처리 완료 후 훅 제거
-handle.remove()
+handle3.remove()
+handle4.remove()
 cv2.destroyAllWindows()
 
 
