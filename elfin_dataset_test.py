@@ -75,7 +75,8 @@ cv2.namedWindow("SmoothGradCAMpp", cv2.WINDOW_NORMAL)
 print("\n=== LayerCAM 특징맵 생성 (Jet Colormap) ===")
 # 1a. CAM 추출기 및 데이터 준비
 cam_extractor_layercam = LayerCAM(backbone, target_layer=backbone.bn2)
-out_layercam = backbone(representative_image_tensor.unsqueeze(0).to('cuda'))
+with torch.enable_grad():
+    out_layercam = backbone(representative_image_tensor.unsqueeze(0).to('cuda'))
 activation_map_layercam = cam_extractor_layercam(out_layercam.squeeze(0).argmax().item(), out_layercam)
 
 # 1b. Activation map 정제 및 시각화
