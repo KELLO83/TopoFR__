@@ -16,6 +16,8 @@ load_result = backbone.load_state_dict(torch.load(Weight_path, map_location='cpu
     
         
 backbone = backbone.to('cuda')
+backbone.eval()
+
 cam_model = copy.deepcopy(backbone)
 cam_model = cam_model.to(torch.float32)
 
@@ -34,11 +36,14 @@ print(backbone)
 feature_maps_layer4 = []
 def hook_fn_layer4(module, input, output):
     feature_maps_layer4.append(output)
+
 target_layer4 = backbone.layer4
 handle4 = target_layer4.register_forward_hook(hook_fn_layer4)
+
 cv2.namedWindow('LayerCAM',cv2.WINDOW_NORMAL)
 cv2.namedWindow('layer hook',cv2.WINDOW_NORMAL)
 cv2.namedWindow("EigenCAM on Layer4")
+
 for f in file_list:
     image = cv2.imread(f)
 
@@ -47,12 +52,12 @@ for f in file_list:
     image = cv2.resize(image, (112, 112),interpolation=cv2.INTER_CUBIC if image.shape[0] > 112 else cv2.INTER_AREA)
 
     input_tensor = transforms_v2(image)
+
     cam_extractor_layercam = LayerCAM(backbone, target_layer=backbone.bn2)
-    out_layercam = backbone(input_tensor.unsqueeze(0).to('cuda'))
+    with torch.enable_grad():
+        out_layercam = backbone(input_tensor.unsqueeze(0).to('cuda'))
 
     activation_map_layercam = cam_extractor_layercam(out_layercam.squeeze(0).argmax().item(), out_layercam)
-    print("Activation layer cam shaep : ",activation_map_layercam[0].shape)
-
     raw_map_layercam = activation_map_layercam[0].cpu().numpy().squeeze()
     raw_map_layercam = np.nan_to_num(raw_map_layercam).astype(np.float32)
     resized_map_layercam = cv2.resize(raw_map_layercam, (image.shape[1], image.shape[0]))
@@ -60,6 +65,8 @@ for f in file_list:
     colored_heatmap_layercam = cv2.applyColorMap(heatmap_layercam, cv2.COLORMAP_JET)
     overlayed_image_layercam = cv2.addWeighted(image, 0.5, colored_heatmap_layercam, 0.5, 0)
     cv2.imshow("LayerCAM", overlayed_image_layercam)
+
+
 
     # with SmoothGradCAMpp(backbone, target_layer=backbone.bn2) as cam_extractor_sgcam:
     #     input_tensor = input_tensor.to('cuda').unsqueeze(0)

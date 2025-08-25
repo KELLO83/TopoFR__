@@ -152,7 +152,6 @@ class IResNet(nn.Module):
         return nn.Sequential(*layers)
 
     def forward(self, x, phase='train'):
-
         x = self.conv1(x)
         x = self.bn1(x)
         x = self.prelu(x)
