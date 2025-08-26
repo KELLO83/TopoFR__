@@ -40,6 +40,7 @@ def hook_fn_layer4(module, input, output):
 target_layer4 = backbone.layer4
 handle4 = target_layer4.register_forward_hook(hook_fn_layer4)
 
+cam_image = {}
 cv2.namedWindow('LayerCAM',cv2.WINDOW_NORMAL)
 cv2.namedWindow('layer hook',cv2.WINDOW_NORMAL)
 cv2.namedWindow("EigenCAM on Layer4")
@@ -64,6 +65,7 @@ for f in file_list:
     colored_heatmap_layercam = cv2.applyColorMap(heatmap_layercam, cv2.COLORMAP_JET)
     overlayed_image_layercam = cv2.addWeighted(image, 0.5, colored_heatmap_layercam, 0.5, 0)
     overlayed_image_layercam = cv2.resize(overlayed_image_layercam , dsize=(640,640))
+    cam_image['LayerCAM'] = overlayed_image_layercam
     cv2.imshow("LayerCAM", overlayed_image_layercam)
 
 
@@ -92,6 +94,7 @@ for f in file_list:
     heatmap4 = np.uint8(255 * heatmap4)
     heatmap4_color = cv2.applyColorMap(heatmap4, cv2.COLORMAP_JET)
     superimposed4 = cv2.addWeighted(original_img_rgb, 0.5, heatmap4_color, 0.5, 0)
+    cam_image['layer hook'] = superimposed4
     cv2.imshow("layer hook", superimposed4)
 
 
@@ -107,6 +110,7 @@ for f in file_list:
     image_resized = cv2.resize(image, (112, 112))
     rgb_img_float = np.float32(cv2.cvtColor(image_resized, cv2.COLOR_BGR2RGB)) / 255
     visualization = show_cam_on_image(rgb_img_float, grayscale_cam, use_rgb=True)
+    cam_image['EigenCAM on Layer4'] = visualization
     cv2.imshow("EigenCAM on Layer4", visualization)
 
 
@@ -128,5 +132,49 @@ for f in file_list:
     visualization_scorecam = show_cam_on_image(rgb_img_float, grayscale_cam_scorecam, use_rgb=True)
     cv2.namedWindow("ScoreCAM", cv2.WINDOW_NORMAL) 
     cv2.imshow("ScoreCAM", visualization_scorecam)
+    cam_image['ScoreCAM'] = visualization_scorecam
 
+    from pytorch_grad_cam import GradCAMPlusPlus
+
+    print("=== GradCAM++ Visualization ===")
+
+    GRAD_CAM_MODEL = IResNet(IBasicBlock, [6, 26, 60, 6], num_classes=360232, retun_logit=True)
+    GRAD_CAM_MODEL.load_state_dict(backbone.state_dict())
+    GRAD_CAM_MODEL = GRAD_CAM_MODEL.to('cuda:1')
+    GRAD_CAM_MODEL.eval()
+
+
+    target_layers_gradcam = [GRAD_CAM_MODEL.layer4[-1].bn3]
+    cam_gradcam_plus = GradCAMPlusPlus(
+        model=GRAD_CAM_MODEL,
+        target_layers=target_layers_gradcam,
+    )
+    
+    targets = None 
+
+    grayscale_cam_gradcam_plus = cam_gradcam_plus(input_tensor=input_tensor.to('cuda:1'), targets=targets)
+    grayscale_cam_gradcam_plus = grayscale_cam_gradcam_plus[0, :]
+
+    visualization_gradcam_plus = show_cam_on_image(rgb_img_float, grayscale_cam_gradcam_plus, use_rgb=True)
+    cv2.namedWindow("GradCAM++", cv2.WINDOW_NORMAL)
+    cv2.imshow("GradCAM++", visualization_gradcam_plus)
+    cam_image['GradCAM++'] = visualization_gradcam_plus
     cv2.waitKey(0)
+
+
+    # import matplotlib.pyplot as plt
+
+    # plt.figure(figsize=(20, 5))
+    # for idx, (name, array) in enumerate(cam_image.items()):
+    #     plt.subplot(1, len(cam_image), idx + 1)
+    #     plt.title(name)
+    #     if name == 'LayerCAM':
+    #         plt.imshow(cv2.cvtColor(array, cv2.COLOR_BGR2RGB))
+    #     else:
+    #         plt.imshow(array)
+    #     plt.axis('off')
+    # plt.tight_layout()
+    # plt.show()
+         
+    
+

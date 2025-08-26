@@ -69,12 +69,13 @@ class IResNet(nn.Module):
     fc_scale = 7 * 7
     def __init__(self,
                  block, layers, dropout=0, num_features=512, zero_init_residual=False,
-                 groups=1, width_per_group=64, replace_stride_with_dilation=None, fp16=False, num_classes=512):
+                 groups=1, width_per_group=64, replace_stride_with_dilation=None, fp16=False, num_classes=512 , retun_logit = False):
         super(IResNet, self).__init__()
         self.extra_gflops = 0.0
         self.fp16 = fp16
         self.inplanes = 64
         self.dilation = 1
+        self.retrun_logit = retun_logit
         if replace_stride_with_dilation is None:
             replace_stride_with_dilation = [False, False, False]
         if len(replace_stride_with_dilation) != 3:
@@ -151,7 +152,7 @@ class IResNet(nn.Module):
 
         return nn.Sequential(*layers)
 
-    def forward(self, x, phase='train'):
+    def forward(self, x):
         x = self.conv1(x)
         x = self.bn1(x)
         x = self.prelu(x)
@@ -164,17 +165,13 @@ class IResNet(nn.Module):
         x = self.dropout(x)
         x = self.fc(x.float() if self.fp16 else x)
         x = self.features(x)
-        bottleneck_embedding = x
-        return bottleneck_embedding
-        # if phase != 'infer':
-        #     with torch.amp.autocast(device_type='cuda'):
-        #         norm_embeddings = normalize(x)
-        #         norm_weight_activated = normalize(self.weight)
-        #         logits = linear(norm_embeddings, norm_weight_activated)
-        #     #return logits
-        #     return logits, bottleneck_embedding
-        # else:
-        #     return x
+        if self.retrun_logit == False:
+            return x
+        else:
+            norm_embeddings = normalize(x)
+            norm_weight_activated = normalize(self.weight)
+            logits = linear(norm_embeddings, norm_weight_activated)
+            return logits
 
 
 
